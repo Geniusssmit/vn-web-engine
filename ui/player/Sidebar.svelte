@@ -3,6 +3,8 @@
   import InstallationFiles from './InstallationFiles.svelte';
   import SaveFiles from './SaveFiles.svelte';
   import AudioDiagnostics from './AudioDiagnostics.svelte';
+  import PerformanceDiagnostics from './PerformanceDiagnostics.svelte';
+  import RuntimeProfile from './RuntimeProfile.svelte';
   import {legacyAokanaProfile} from '../game-profiles/aokana.js';
   export let game: GameId;
 </script>
@@ -63,6 +65,7 @@
     </section>
     <SaveFiles {game} runtime />
     {#if game === 'buriko'}
+      <RuntimeProfile />
       <section id="playback-options" hidden>
         <h2>Playback</h2>
         <button id="skip-startup" type="button" aria-pressed="false" disabled hidden
@@ -72,5 +75,6 @@
     {/if}
     <p id="status" role="status">No game loaded.</p>
     <AudioDiagnostics />
+    <PerformanceDiagnostics />
   </div>
 </aside>

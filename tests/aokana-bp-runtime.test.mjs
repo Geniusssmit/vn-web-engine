@@ -21,6 +21,8 @@ import {
 import {BurikoBpModuleExtensions} from '../dist/engines/buriko/bp/module-extensions.js';
 import {BurikoBpInterpreter} from '../dist/engines/buriko/bp/interpreter.js';
 import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {controlOpcodes} from '../dist/engines/buriko/bp/opcodes/control.js';
+import {integerOpcodes} from '../dist/engines/buriko/bp/opcodes/integer.js';
 import {attachModule} from '../dist/engines/buriko/bp/modules.js';
 import {
   BurikoDistributedAllocator,
@@ -28,6 +30,13 @@ import {
 } from '../dist/engines/buriko/native/distributed-processing.js';
 import {BurikoGridEvaluationWorkers} from '../dist/engines/buriko/native/grid-evaluation-workers.js';
 import {BurikoLogicalGridManagers} from '../dist/engines/buriko/native/logical-grid.js';
+import {
+  getRuntimePerformanceSnapshot,
+  startRuntimePerformanceRecording,
+  stopRuntimePerformanceRecording,
+} from '../dist/platform/runtime-performance.js';
+
+import {setRuntimeProfile} from '../dist/platform/runtime-profile.js';
 
 const thread = (id = 1, moduleCapacity = 256, frameCapacity = 256) =>
   new BurikoBpThread({id, operandCapacity: 16, moduleCapacity, frameCapacity, heapEnabled: false});
@@ -196,6 +205,7 @@ test('poll results -1 and 1 destroy the current process; other nonzero results r
 
 test('a missing selected thread ends traversal; burst limit is exactly 0x400000', async () => {
   let count = 0;
+  let hostPulseAt = -1;
   const scheduler = new BurikoBpScheduler(
     root(),
     () => {
@@ -205,8 +215,16 @@ test('a missing selected thread ends traversal; burst limit is exactly 0x400000'
     () => {},
   );
   scheduler.append(thread());
-  assert.equal(await scheduler.run(), 0);
+  const pulse = setTimeout(() => {
+    hostPulseAt = count;
+  }, 0);
+  try {
+    assert.equal(await scheduler.run(), 0);
+  } finally {
+    clearTimeout(pulse);
+  }
   assert.equal(count, BURIKO_BP_BURST_INSTRUCTIONS);
+  assert.ok(hostPulseAt >= 0 && hostPulseAt < count, 'host tasks run inside the native burst');
   const jump = new BurikoBpScheduler(
     root(),
     () => 3,
@@ -261,6 +279,68 @@ test('native coverage requires all 840 exact distinct slots, rejecting duplicate
     /matching verified slot/,
   );
   assert.doesNotThrow(() => new BurikoNativeBank(list));
+});
+
+test('VM diagnostics distinguish synchronous native/process work from Promise settlement without changing results', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  t.after(stopRuntimePerformanceRecording);
+  const list = definitions();
+  const slot = list[0];
+  let invoke = () => {
+    now += 6;
+    return 0;
+  };
+  const bank = new BurikoNativeBank([{...slot, execute: () => invoke()}, ...list.slice(1)]);
+  const context = {thread: thread()};
+  startRuntimePerformanceRecording();
+  assert.equal(bank.execute(slot.primary, slot.secondary, context), 0);
+  let resolve;
+  const pending = new Promise((done) => {
+    resolve = done;
+  });
+  invoke = () => pending;
+  assert.equal(bank.execute(slot.primary, slot.secondary, context), pending);
+  now += 30;
+  resolve(4);
+  assert.equal(await pending, 4);
+  const fault = new Error('native test fault');
+  invoke = () => {
+    now += 7;
+    throw fault;
+  };
+  assert.throws(
+    () => bank.execute(slot.primary, slot.secondary, context),
+    (error) => error === fault,
+  );
+
+  const node = new BurikoBpScheduledThread(context.thread);
+  node.installProcess({
+    enqueueMessage() {},
+    poll() {
+      now += 8;
+      return 1;
+    },
+    dispose() {
+      now += 9;
+    },
+  });
+  assert.equal(node.pollProcess(false), 1);
+  assert.equal(node.process, null);
+  stopRuntimePerformanceRecording();
+  const events = getRuntimePerformanceSnapshot().events.filter((event) => event.kind === 'span');
+  assert.deepEqual(
+    events.map(({name, durationMs}) => [name, durationMs]),
+    [
+      ['buriko.native.sync', 6],
+      ['buriko.native.async-elapsed', 30],
+      ['buriko.native.sync', 7],
+      ['buriko.process.poll-sync', 8],
+      ['buriko.process.finish', 9],
+    ],
+  );
+  for (const event of events.filter((event) => event.name.startsWith('buriko.native.')))
+    assert.deepEqual(event.detail, {primary: slot.primary, secondary: slot.secondary});
 });
 
 test('FF mediation appends two modules, saves opcode start+2, and removes both before restoring', () => {
@@ -321,7 +401,7 @@ test('interpreter fetch preserves instruction start across secondary fetch and r
     directHandlers(),
     new BurikoNativeBank(native),
     extensions,
-    (thread) => ({thread, memory: {}, diagnostics}),
+    (thread) => ({thread, memory: new BurikoBpMemory(new Uint8Array()), diagnostics}),
   );
   attachModule(state, 'synthetic', module([0x80, 0, 0x80, 0xff, 0x07]));
   assert.equal(interpreter.step(state), 1);
@@ -352,6 +432,300 @@ test('blocking asynchronous host work preserves the burst and forbids concurrent
   release(0);
   assert.equal(await running, 0);
   assert.deepEqual(order, [1, 1, 2]);
+});
+
+test('only native slots that opt into batching amortize clock reads', async (t) => {
+  let clockReads = 0;
+  t.mock.method(performance, 'now', () => {
+    clockReads++;
+    return 0;
+  });
+  const memory = new BurikoBpMemory(new Uint8Array()),
+    diagnostics = new BurikoBpDiagnostics(noNotice);
+  const run = async (batchable) => {
+    const child = thread(1, 512);
+    let calls = 0;
+    const interpreter = new BurikoBpInterpreter(
+      {...directHandlers(), ...controlOpcodes, ...integerOpcodes},
+      new BurikoNativeBank(
+        definitions().map((definition) => {
+          if (definition.primary !== 0x80 || definition.secondary > 1) return definition;
+          return definition.secondary === 0
+            ? {...definition, batchable, execute: () => (calls++, 0)}
+            : {...definition, execute: () => 1};
+        }),
+      ),
+      new BurikoBpModuleExtensions({readModule: noNotice}),
+      (state) => ({thread: state, memory, diagnostics}),
+    );
+    const scheduler = new BurikoBpScheduler(root());
+    scheduler.bindInstructionExecutor(
+      (state) => interpreter.step(state),
+      interpreter.batchableOpcodes,
+      interpreter.batchableNativeSlots,
+    );
+    attachModule(child, 'synthetic', module([...Array(128).fill([0x80, 0]).flat(), 0x80, 1]));
+    scheduler.append(child);
+    clockReads = 0;
+    assert.equal(await scheduler.run(), 0);
+    assert.equal(calls, 128);
+    return clockReads;
+  };
+  assert.ok((await run(false)) > 128);
+  assert.ok((await run(true)) < 16);
+});
+
+for (const profile of ['native', 'browser-optimized']) {
+  test(`${profile}: real bytecode amortizes small work without delaying native or replacement handlers`, async (t) => {
+    setRuntimeProfile(profile);
+    t.after(() => setRuntimeProfile('native'));
+    let now = 0,
+      clockReads = 0,
+      executed = 0;
+    t.mock.method(performance, 'now', () => {
+      clockReads++;
+      return now;
+    });
+    const child = thread(1, 512),
+      order = [],
+      timers = [],
+      memory = new BurikoBpMemory(new Uint8Array()),
+      diagnostics = new BurikoBpDiagnostics(noNotice);
+    const expensive = (name) => {
+      order.push(name);
+      now += 20;
+      timers.push(
+        setTimeout(() => {
+          assert.equal(scheduler.hasActiveInvocation, true);
+          assert.equal(scheduler.isDispatchingInstructionFor(child), false);
+          order.push(`host:${name}`);
+        }, 0),
+      );
+    };
+    t.after(() => {
+      for (const timer of timers) clearTimeout(timer);
+    });
+    const interpreter = new BurikoBpInterpreter(
+      {
+        ...directHandlers(),
+        ...controlOpcodes,
+        ...integerOpcodes,
+        0x06: () => {
+          expensive('replacement');
+          return 0;
+        },
+      },
+      new BurikoNativeBank(
+        definitions().map((definition) => {
+          if (definition.primary !== 0x80 || definition.secondary > 2) return definition;
+          return {
+            ...definition,
+            execute: () => {
+              if (definition.secondary === 2) {
+                order.push('end');
+                return 1;
+              }
+              expensive(definition.secondary === 0 ? 'sync' : 'async');
+              return definition.secondary === 0 ? 0 : Promise.resolve(0);
+            },
+          };
+        }),
+      ),
+      new BurikoBpModuleExtensions({readModule: noNotice}),
+      (thread) => ({thread, memory, diagnostics}),
+    );
+    const scheduler = new BurikoBpScheduler(root());
+    scheduler.bindInstructionExecutor((state) => {
+      executed++;
+      now += 0.04;
+      return interpreter.step(state);
+    }, interpreter.batchableOpcodes);
+    attachModule(
+      child,
+      'synthetic',
+      module([
+        ...Array.from({length: 128}, () => [0x00, 7, 0x73]).flat(),
+        0x80,
+        0,
+        0x00,
+        1,
+        0x73,
+        0x80,
+        1,
+        0x00,
+        2,
+        0x73,
+        0x06,
+        0x00,
+        3,
+        0x73,
+        0x80,
+        2,
+      ]),
+    );
+    scheduler.append(child);
+    let firstHostAt;
+    timers.push(
+      setTimeout(() => {
+        firstHostAt = executed;
+      }, 0),
+    );
+    assert.equal(await scheduler.run(), 0);
+    assert.equal(executed, 266);
+    assert.equal(child.stackIndex, 0);
+    assert.ok(
+      firstHostAt >= 100 && firstHostAt <= 164,
+      `host serviced at instruction ${firstHostAt}`,
+    );
+    assert.deepEqual(order, [
+      'sync',
+      'host:sync',
+      'async',
+      'host:async',
+      'replacement',
+      'host:replacement',
+      'end',
+    ]);
+    assert.ok(clockReads < 40, `${clockReads} clock reads`);
+    assert.equal(scheduler.hasActiveInvocation, false);
+  });
+
+  test(`${profile}: expensive polls and short instruction sequences service host tasks without changing traversal`, async (t) => {
+    setRuntimeProfile(profile);
+    t.after(() => setRuntimeProfile('native'));
+    let now = 0;
+    t.mock.method(performance, 'now', () => now);
+    const order = [],
+      hostLeases = [],
+      timers = [],
+      child = thread(1),
+      calls = new Map();
+    const pulse = (name) => {
+      timers.push(
+        setTimeout(() => {
+          order.push(`host:${name}`);
+          hostLeases.push([
+            scheduler.hasActiveInvocation,
+            scheduler.hasActiveProcessPoll,
+            scheduler.isDispatchingInstructionFor(child),
+          ]);
+        }, 0),
+      );
+    };
+    t.after(() => {
+      for (const timer of timers) clearTimeout(timer);
+    });
+    const scheduler = new BurikoBpScheduler(
+      root(),
+      (state) => {
+        const count = calls.get(state.id) ?? 0;
+        calls.set(state.id, count + 1);
+        order.push(`instruction:${state.id}:${count}`);
+        if (state.id === 2) return 4;
+        if (count === 0) {
+          now += 50;
+          pulse('sync');
+          return 0;
+        }
+        if (count === 1) {
+          now += 50;
+          pulse('async');
+          return Promise.resolve(0);
+        }
+        if (count < 4) {
+          now += 3;
+          if (count === 2) pulse('microtasks');
+          return Promise.resolve(0);
+        }
+        return 5;
+      },
+      (node) => order.push(`removed:${node.state.id}`),
+    );
+    const node = scheduler.append(child);
+    scheduler.append(thread(2));
+    node.installProcess({
+      enqueueMessage() {},
+      poll() {
+        order.push('poll');
+        now += 50;
+        pulse('poll');
+        return Promise.resolve(1);
+      },
+      dispose() {
+        order.push('dispose');
+      },
+    });
+
+    assert.equal(await scheduler.run(), 2);
+    assert.deepEqual(order, [
+      'poll',
+      'dispose',
+      'host:poll',
+      'instruction:1:0',
+      'host:sync',
+      'instruction:1:1',
+      'host:async',
+      'instruction:1:2',
+      'instruction:1:3',
+      'host:microtasks',
+      'instruction:1:4',
+      'instruction:2:0',
+      'removed:2',
+    ]);
+    assert.deepEqual(
+      hostLeases,
+      Array.from({length: 4}, () => [true, false, false]),
+    );
+    assert.equal(node.process, null);
+    assert.equal(node.flags & 1, 0);
+    assert.equal(scheduler.hasActiveInvocation, false);
+    assert.equal(scheduler.hasActiveProcessPoll, false);
+    assert.equal(scheduler.firstThread, node);
+    assert.equal(node.next, null);
+    scheduler.removeAllChildren();
+    assert.equal(child.disposed, true);
+  });
+}
+
+test('browser profile services background work after a cheap complete traversal, including polling-only passes', async (t) => {
+  setRuntimeProfile('browser-optimized');
+  t.after(() => setRuntimeProfile('native'));
+  t.mock.method(performance, 'now', () => 0);
+  const order = [];
+  let calls = 0;
+  const scheduler = new BurikoBpScheduler(root(), (state) => {
+    order.push(state.id);
+    return state.id === 1 && calls++ === 0 ? 2 : 1;
+  });
+  scheduler.attachDataCodecWorkers({hasPendingWork: () => true});
+  const first = scheduler.append(thread(1));
+  const second = scheduler.append(thread(2));
+  let hostLease;
+  const pulse = () =>
+    setTimeout(() => {
+      order.push('host');
+      hostLease = [scheduler.hasActiveInvocation, scheduler.hasActiveProcessPoll];
+    }, 0);
+  let timer = pulse();
+  t.after(() => clearTimeout(timer));
+  assert.equal(await scheduler.run(), 0);
+  assert.deepEqual(order, [1, 1, 2, 'host']);
+  assert.deepEqual(hostLease, [true, false]);
+  order.length = 0;
+  for (const node of [first, second])
+    node.installProcess({
+      enqueueMessage() {},
+      poll() {
+        order.push(`poll:${node.state.id}`);
+        return 0;
+      },
+      dispose() {},
+    });
+  timer = pulse();
+  assert.equal(await scheduler.run(), 0);
+  assert.deepEqual(order, ['poll:1', 'poll:2', 'host']);
+  assert.deepEqual(hostLease, [true, false]);
+  scheduler.removeAllChildren();
 });
 
 test('thread destruction frees local storage before process and recursively removes shared borrowers', () => {

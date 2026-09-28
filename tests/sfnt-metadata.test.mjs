@@ -3,6 +3,7 @@ import test from 'node:test';
 import {readSfntFontData, readSfntFontMetadata} from '../dist/formats/sfnt.js';
 import {readBurikoFontData} from '../dist/engines/buriko/native/font-data.js';
 import {readBrowserLocalFontMetadata} from '../dist/text/browser-local-fonts.js';
+import {setRuntimeProfile} from '../dist/platform/runtime-profile.js';
 
 const tag = (value) =>
   [...value].reduce((number, character) => number * 256 + character.charCodeAt(0), 0);
@@ -124,7 +125,12 @@ test('metadata enumeration skips multi-gigabyte glyph data and retains only owne
     [metadata[0].winAscent, metadata[0].winDescent, metadata[0].weight, metadata[0].italic],
     [1900, 500, 700, true],
   );
-  assert.ok(source.reads.reduce((sum, [, length]) => sum + length, 0) < 512);
+  // Header, directory, then one read spanning the nearby needed tables (head through post).
+  assert.deepEqual(source.reads, [
+    [0, 12],
+    [12, 96],
+    [512, 528],
+  ]);
   for (const name of metadata[0].names) {
     assert.equal(name.bytes.buffer.byteLength, name.bytes.byteLength);
     assert.notEqual(name.bytes.buffer, source.bytes.buffer);
@@ -220,4 +226,76 @@ test('browser font catalog uses blob slices and isolates denied or invalid font 
     }),
     [],
   );
+});
+
+test('font catalog bounds concurrent metadata jobs and preserves query and collection order', async () => {
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  for (const profile of ['native', 'browser-optimized']) {
+    const capacity = profile === 'native' ? 1 : 4;
+    const started = [],
+      gates = Array.from({length: 7}, () => Promise.withResolvers());
+    const records = gates.map((gate, index) => ({
+      family: `Family ${index}`,
+      fullName: `Full ${index}`,
+      postscriptName: `Postscript${index}`,
+      async blob() {
+        started.push(index);
+        if (index === 5) throw new Error('Denied');
+        if (index === 4) return new Blob([new Uint8Array(12)]);
+        const source = fixture({collection: index === 0, glyphLength: 2 ** 31});
+        return {
+          size: source.size,
+          slice(start, end) {
+            return {
+              async arrayBuffer() {
+                await gate.promise;
+                return (await source.read(start, end - start)).slice().buffer;
+              },
+            };
+          },
+        };
+      },
+    }));
+    try {
+      setRuntimeProfile(profile);
+      const pending = readBrowserLocalFontMetadata({
+        async queryLocalFonts() {
+          // Changing policy while the query is pending affects the next catalog.
+          setRuntimeProfile(profile === 'native' ? 'browser-optimized' : 'native');
+          return records;
+        },
+      });
+      await flush();
+      assert.deepEqual(
+        started,
+        Array.from({length: capacity}, (_, index) => index),
+      );
+      // Finish the last admitted metadata read first, leaving earlier reads pending.
+      gates[capacity - 1].resolve();
+      await flush();
+      assert.deepEqual(started, capacity === 1 ? [0, 1] : [0, 1, 2, 3, 4, 5, 6]);
+      for (const gate of gates) gate.resolve();
+      const catalog = await pending;
+      assert.deepEqual(
+        catalog.map(({family, fullName, postscriptName, data}) => [
+          family,
+          fullName,
+          postscriptName,
+          data.names[0].unicode,
+        ]),
+        [
+          [0, 'Synthetic Font'],
+          [0, 'Second Font'],
+          [1, 'Synthetic Font'],
+          [2, 'Synthetic Font'],
+          [3, 'Synthetic Font'],
+          [6, 'Synthetic Font'],
+        ].map(([index, name]) => [`Family ${index}`, `Full ${index}`, `Postscript${index}`, name]),
+      );
+      assert.ok(catalog.every(({data}) => !Object.hasOwn(data, 'bytes')));
+    } finally {
+      for (const gate of gates) gate.resolve();
+      setRuntimeProfile('native');
+    }
+  }
 });

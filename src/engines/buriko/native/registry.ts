@@ -6,6 +6,7 @@ import {
   BURIKO_1665_PRIMARY_SLOT_ADDRESSES,
 } from './inventory-1665.js';
 import {BURIKO_BP_ABI_172, type BurikoBpAbi} from '../bp/abi.js';
+import {beginRuntimeSpan} from '../../../platform/runtime-performance.js';
 import type {
   BurikoBpOpcodeContext,
   BurikoBpInstructionResult,
@@ -98,6 +99,15 @@ export class BurikoNativeBank {
     this.handlers = handlers;
   }
 
+  /** Secondaries whose selected definition opted into clock-read batching, by primary. */
+  batchableSecondaries(primary: number): readonly boolean[] | undefined {
+    let result: boolean[] | undefined;
+    for (const [key, definition] of this.handlers)
+      if (key >>> 8 === primary && definition.batchable === true)
+        (result ??= new Array<boolean>(256).fill(false))[key & 255] = true;
+    return result && Object.freeze(result);
+  }
+
   execute(
     primary: number,
     secondary: number,
@@ -109,7 +119,23 @@ export class BurikoNativeBank {
         `Invalid Buriko native opcode ${hexSlot(primary, secondary)} at 0x${context.thread.instructionStart.toString(16)}`,
       );
     }
-    return definition.execute(context);
+    const finish = beginRuntimeSpan('buriko.native.sync');
+    let result: BurikoBpInstructionResult;
+    try {
+      result = definition.execute(context);
+    } finally {
+      finish?.({primary, secondary});
+    }
+    if (typeof result !== 'number') {
+      // Observe settlement without replacing the native Promise or changing its result.
+      // Resumed CPU work is included here, so this is not an I/O wait measurement.
+      const finishAsync = beginRuntimeSpan('buriko.native.async-elapsed');
+      if (finishAsync) {
+        const settled = () => finishAsync({primary, secondary});
+        void result.then(settled, settled);
+      }
+    }
+    return result;
   }
 }
 

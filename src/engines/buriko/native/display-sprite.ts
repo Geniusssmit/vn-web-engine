@@ -7,6 +7,7 @@ import {
   allocateBurikoBitmap,
   burikoBitmapRectangle,
   cropBurikoBitmap,
+  initializedBurikoBitmapView,
   type BurikoBitmap,
   type BurikoBitmapRectangle,
 } from './bitmap.js';
@@ -29,6 +30,10 @@ import {blendMixedBurikoBitmapsIntoRgb, mixBurikoBitmaps} from './bitmap-mix.js'
 import {reduceBurikoBitmapHalf} from './bitmap-reduce.js';
 import {blendRevealedBurikoBitmap, revealBurikoBitmap} from './bitmap-reveal.js';
 import {waveBurikoBitmap} from './bitmap-wave.js';
+import {beginRuntimeSpan, recordRuntimeMetric} from '../../../platform/runtime-performance.js';
+import {getRuntimeProfile} from '../../../platform/runtime-profile.js';
+import {hasRasterText} from '../../../text/raster-text.js';
+import {cancelBurikoSpriteMix, deferBurikoSpriteMix} from './display-update-batch.js';
 import {nativeAffineSineCosine, nativeDisplayEasing} from '../bp/opcodes/native-math.js';
 import {
   BurikoDisplayObject,
@@ -41,6 +46,30 @@ import {burikoSpriteBounds} from './sprite-bounds.js';
 import type {BurikoSurfaces} from './surfaces.js';
 
 export type BurikoSpriteMode = 0 | 1 | 2 | 3 | 4 | 5 | 6;
+
+// Fixed labels keep subthreshold draws attributable without retaining per-sprite events.
+const DRAW_TIMINGS = [
+  'simple',
+  'blend',
+  'affine',
+  'reveal',
+  'displacement',
+  'affine-blend',
+  'mesh',
+].map((mode) => {
+  const name = `buriko.sprite.draw.${mode}`;
+  return {
+    name,
+    width: `${name}.width`,
+    height: `${name}.height`,
+    pixels: `${name}.pixels`,
+    format: `${name}.format`,
+    sampling: `${name}.sampling`,
+    blendMode: `${name}.blend-mode`,
+    effects: `${name}.effects`,
+    mask: `${name}.mask`,
+  };
+});
 export type BurikoSpriteConfigurationStatus =
   | 0
   | 0x80000001
@@ -190,6 +219,7 @@ export class BurikoDisplaySprite extends BurikoDisplayObject {
   private readonly sourceMipmaps: (BurikoBitmap | null)[] = Array(4).fill(null);
   private readonly secondaryMipmaps: (BurikoBitmap | null)[] = Array(4).fill(null);
   private mixedBitmap: BurikoBitmap | null = null;
+  private mixedScratch: BurikoBitmap | null = null;
   private mixedLevel = 0;
   private mixedValue = 0;
   private waveBitmap: BurikoBitmap | null = null;
@@ -278,8 +308,18 @@ export class BurikoDisplaySprite extends BurikoDisplayObject {
     }
   }
 
-  private clearMixed(): void {
-    this.mixedBitmap = releaseOwned(this.mixedBitmap);
+  private clearMixed(retainDestination = false): void {
+    cancelBurikoSpriteMix(this.environment, this);
+    if (retainDestination) {
+      if (this.mixedBitmap !== null) {
+        this.mixedScratch = releaseOwned(this.mixedScratch);
+        this.mixedScratch = this.mixedBitmap;
+        this.mixedBitmap = null;
+      }
+    } else {
+      this.mixedBitmap = releaseOwned(this.mixedBitmap);
+      this.mixedScratch = releaseOwned(this.mixedScratch);
+    }
     this.mixedLevel = 0;
   }
 
@@ -934,9 +974,20 @@ export class BurikoDisplaySprite extends BurikoDisplayObject {
     this.clearMipmaps();
     const source = this.currentSource();
     if (source === null) return;
-    this.reduceChain(source, this.sourceMipmaps);
-    const secondary = this.currentSecondary();
-    if (secondary !== null) this.reduceChain(secondary, this.secondaryMipmaps);
+    const finishTiming = beginRuntimeSpan('buriko.sprite.mipmaps');
+    let secondary: BurikoBitmap | null = null;
+    try {
+      this.reduceChain(source, this.sourceMipmaps);
+      secondary = this.currentSecondary();
+      if (secondary !== null) this.reduceChain(secondary, this.secondaryMipmaps);
+    } finally {
+      finishTiming?.({
+        width: source.width,
+        height: source.height,
+        format: source.format,
+        secondary: secondary !== null,
+      });
+    }
   }
 
   /** 061140 updates the four retained levels from one inclusive source rectangle. */
@@ -1090,34 +1141,146 @@ export class BurikoDisplaySprite extends BurikoDisplayObject {
   }
 
   /** 062DA0 stores the actual mixed level and value used by modes five and six. */
-  private refreshMixed(): void {
-    this.clearMixed();
-    if ((this.mode !== 5 && this.mode !== 6) || this.secondarySurface === -1) return;
+  private refreshMixed(allowBatch = true): void {
+    this.clearMixed(getRuntimeProfile() === 'browser-optimized');
+    if ((this.mode !== 5 && this.mode !== 6) || this.secondarySurface === -1) {
+      this.clearMixed();
+      return;
+    }
     const first = this.selectedSource();
-    if (first === null) return;
+    if (first === null) {
+      this.clearMixed();
+      return;
+    }
     const second = this.selectedSecondary(first.level);
-    if (second === null) return;
-    const destination = allocateBurikoBitmap(
-      first.bitmap.width,
-      first.bitmap.height,
-      first.bitmap.format,
-    );
-    mixBurikoBitmaps(
-      destination,
-      first.bitmap,
-      second,
-      this.mixValue,
-      this.environment.compositor.processing,
-      1,
-    );
-    this.mixedBitmap = destination;
-    this.mixedLevel = first.level;
-    this.mixedValue = this.mixValue;
+    if (second === null) {
+      this.clearMixed();
+      return;
+    }
+    const factor = this.mixValue;
+    if (
+      allowBatch &&
+      getRuntimeProfile() === 'browser-optimized' &&
+      Number.isInteger(factor) &&
+      factor >= 0 &&
+      factor <= 256 &&
+      (first.bitmap.format === 1 || first.bitmap.format === 2) &&
+      second.format === first.bitmap.format &&
+      first.bitmap.width === second.width &&
+      first.bitmap.height === second.height &&
+      [first.bitmap, second].every(
+        (bitmap) =>
+          bitmap.bytesPerPixel === 4 &&
+          Number.isInteger(bitmap.width) &&
+          Number.isInteger(bitmap.height) &&
+          bitmap.width > 0 &&
+          bitmap.height > 0 &&
+          bitmap.stride === (bitmap.stride | 0) &&
+          bitmap.stride >= bitmap.width * 4 &&
+          bitmap.width * bitmap.height * 4 <= 0xffffffff &&
+          bitmap.storage?.bytes.buffer instanceof ArrayBuffer &&
+          initializedBurikoBitmapView(bitmap, bitmap.width, bitmap.height) !== null,
+      ) &&
+      deferBurikoSpriteMix(this.environment, this, () => {
+        this.buildMixed(first, second, factor);
+        recordRuntimeMetric('buriko.sprite.mix.batch-flush', 1);
+      })
+    ) {
+      recordRuntimeMetric('buriko.sprite.mix.deferred', 1);
+      return;
+    }
+    this.buildMixed(first, second, factor);
+  }
+
+  /** A control step can replace unused intermediate mixes; consumers force them immediately. */
+  private buildMixed(first: SelectedBitmap, second: BurikoBitmap, factor: number): void {
+    const finishTiming = beginRuntimeSpan('buriko.sprite.mix');
+    try {
+      let destination = this.takeMixedDestination(first.bitmap, second, factor);
+      const reused = destination !== null;
+      if (destination === null) {
+        const finishAllocation = beginRuntimeSpan('buriko.sprite.mix.allocate-destination');
+        try {
+          destination = allocateBurikoBitmap(
+            first.bitmap.width,
+            first.bitmap.height,
+            first.bitmap.format,
+          );
+        } finally {
+          finishAllocation?.();
+        }
+      }
+      try {
+        mixBurikoBitmaps(
+          destination,
+          first.bitmap,
+          second,
+          factor,
+          this.environment.compositor.processing,
+          1,
+        );
+      } catch (error) {
+        if (reused) releaseOwned(destination);
+        throw error;
+      }
+      this.mixedBitmap = destination;
+      this.mixedLevel = first.level;
+      this.mixedValue = factor;
+    } finally {
+      finishTiming?.({
+        width: first.bitmap.width,
+        height: first.bitmap.height,
+        format: first.bitmap.format,
+        factor,
+      });
+    }
+  }
+
+  /** Reuse only private, text-free storage that a checked bounded mix fully replaces. */
+  private takeMixedDestination(
+    first: BurikoBitmap,
+    second: BurikoBitmap,
+    factor: number,
+  ): BurikoBitmap | null {
+    const destination = this.mixedScratch;
+    this.mixedScratch = null;
+    if (destination === null) return null;
+    if (
+      getRuntimeProfile() === 'browser-optimized' &&
+      Number.isInteger(factor) &&
+      factor >= 0 &&
+      factor <= 256 &&
+      (first.format === 1 || first.format === 2) &&
+      [first, second].every(
+        (source) =>
+          source.format === destination.format &&
+          source.width === destination.width &&
+          source.height === destination.height &&
+          source.bytesPerPixel === 4 &&
+          source.stride === (source.stride | 0) &&
+          source.stride >= source.width * 4 &&
+          source.storage?.bytes.buffer instanceof ArrayBuffer &&
+          source.storage.bytes.buffer !== destination.storage?.bytes.buffer &&
+          !hasRasterText(source) &&
+          initializedBurikoBitmapView(source, source.width, source.height) !== null,
+      ) &&
+      destination.offset === 0 &&
+      destination.width > 0 &&
+      destination.height > 0 &&
+      destination.stride === destination.width * 4 &&
+      !hasRasterText(destination) &&
+      initializedBurikoBitmapView(destination, destination.width, destination.height) !== null
+    ) {
+      recordRuntimeMetric('buriko.sprite.mix.reused-destination', 1);
+      return destination;
+    }
+    releaseOwned(destination);
+    return null;
   }
 
   private preWaveSource(): SelectedBitmap | null {
     if (this.secondarySurface !== -1) {
-      if (this.mixedBitmap === null || this.mixedValue !== this.mixValue) this.refreshMixed();
+      if (this.mixedBitmap === null || this.mixedValue !== this.mixValue) this.refreshMixed(false);
       return this.mixedBitmap === null
         ? null
         : {bitmap: {...this.mixedBitmap}, level: this.mixedLevel};
@@ -1135,18 +1298,34 @@ export class BurikoDisplaySprite extends BurikoDisplayObject {
     const source = selected.bitmap,
       expanded = Math.imul((this.waveAmplitude + 0x10000) | 0, source.width | 0) >>> 16,
       extra = ((expanded - source.width + 1) & ~1) | 0,
-      destination = allocateBurikoBitmap((source.width + extra) | 0, source.height, source.format);
-    waveBurikoBitmap(
-      this.environment.compositor,
-      destination,
-      source,
-      unsignedShift(this.wavePeriod, selected.level),
-      unsignedShift(this.wavePhase, selected.level),
-      this.waveAmplitude,
-      true,
-    );
-    this.waveBitmap = destination;
-    this.waveLevel = selected.level;
+      period = unsignedShift(this.wavePeriod, selected.level),
+      finishTiming = beginRuntimeSpan('buriko.sprite.wave');
+    try {
+      const destination = allocateBurikoBitmap(
+        (source.width + extra) | 0,
+        source.height,
+        source.format,
+      );
+      waveBurikoBitmap(
+        this.environment.compositor,
+        destination,
+        source,
+        period,
+        unsignedShift(this.wavePhase, selected.level),
+        this.waveAmplitude,
+        true,
+      );
+      this.waveBitmap = destination;
+      this.waveLevel = selected.level;
+    } finally {
+      finishTiming?.({
+        width: source.width,
+        height: source.height,
+        format: source.format,
+        period,
+        amplitude: this.waveAmplitude,
+      });
+    }
   }
 
   private selectedRenderedSource(): SelectedBitmap | null {
@@ -1724,28 +1903,58 @@ export class BurikoDisplaySprite extends BurikoDisplayObject {
 
   override draw(destination: BurikoBitmap, rectangle: BurikoBitmapRectangle, _key: number): void {
     if (this.maskOwner !== null) return;
-    switch (this.simpleMode()) {
-      case 0:
-        this.drawSimple(destination, rectangle);
-        break;
-      case 1:
-        this.drawBlend(destination, rectangle);
-        break;
-      case 2:
-        this.drawAffine(destination, rectangle, this.selectedSource());
-        break;
-      case 3:
-        this.drawReveal(destination, rectangle);
-        break;
-      case 4:
-        this.drawDisplacement(destination, rectangle);
-        break;
-      case 5:
-        this.drawAffine(destination, rectangle, this.selectedRenderedSource());
-        break;
-      case 6:
-        this.drawMesh(destination, rectangle);
-        break;
+    const mode = this.simpleMode(),
+      timing = DRAW_TIMINGS[mode]!,
+      finishTiming = beginRuntimeSpan(timing.name, undefined, 8);
+    try {
+      switch (mode) {
+        case 0:
+          this.drawSimple(destination, rectangle);
+          break;
+        case 1:
+          this.drawBlend(destination, rectangle);
+          break;
+        case 2:
+          this.drawAffine(destination, rectangle, this.selectedSource());
+          break;
+        case 3:
+          this.drawReveal(destination, rectangle);
+          break;
+        case 4:
+          this.drawDisplacement(destination, rectangle);
+          break;
+        case 5:
+          this.drawAffine(destination, rectangle, this.selectedRenderedSource());
+          break;
+        case 6:
+          this.drawMesh(destination, rectangle);
+          break;
+      }
+    } finally {
+      if (finishTiming) {
+        const width = rectangleWidth(rectangle),
+          height = rectangleHeight(rectangle),
+          effects = this.effects.active,
+          mask = this.staticMaskEnabled !== 0;
+        finishTiming({
+          mode: this.mode,
+          drawMode: mode,
+          width,
+          height,
+          format: destination.format,
+          blendMode: this.blendMode,
+          effects,
+          mask,
+        });
+        recordRuntimeMetric(timing.width, width);
+        recordRuntimeMetric(timing.height, height);
+        recordRuntimeMetric(timing.pixels, width * height);
+        recordRuntimeMetric(timing.format, destination.format);
+        recordRuntimeMetric(timing.sampling, Number(this.sampling !== 0));
+        recordRuntimeMetric(timing.blendMode, this.blendMode);
+        recordRuntimeMetric(timing.effects, Number(effects));
+        recordRuntimeMetric(timing.mask, Number(mask));
+      }
     }
   }
 

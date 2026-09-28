@@ -1,17 +1,19 @@
 import {cloneRasterText, releaseRasterText, withRasterText} from '../../../text/raster-text.js';
+import {indexOfZeroByte} from '../../../core/binary.js';
 
 /** Native bitmap backing identity is shared by cropped descriptors and copied slot records. */
 export class BurikoBitmapStorage {
   readonly bytes: Uint8Array;
   readonly view: DataView;
-  private defined: Uint8Array | null;
+  // A contiguous initialized prefix needs no byte map. Allocate one only for holes.
+  private defined: Uint8Array | null = null;
   private initializedPrefix = 0;
   private disposed = false;
   private nativeHeapReads = false;
   constructor(bytes: Uint8Array, initialized: boolean) {
     this.bytes = bytes;
     this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    this.defined = initialized ? null : new Uint8Array(bytes.length);
+    this.initializedPrefix = initialized ? bytes.length : 0;
   }
   /** Import validity metadata without reading retained pixel storage. */
   static tracked(bytes: Uint8Array, initialized?: Uint8Array): BurikoBitmapStorage {
@@ -20,6 +22,9 @@ export class BurikoBitmapStorage {
       if (initialized.length !== bytes.length)
         throw new RangeError('Buriko bitmap validity does not cover its backing storage');
       storage.defined = initialized.slice();
+      const firstUndefined = indexOfZeroByte(storage.defined);
+      if (firstUndefined < 0) storage.defined = null;
+      else storage.initializedPrefix = firstUndefined;
     }
     return storage;
   }
@@ -33,15 +38,31 @@ export class BurikoBitmapStorage {
       offset + length > this.bytes.length
     )
       throw new RangeError('Buriko bitmap accesses outside native allocation');
-    if (read && this.defined !== null && !this.nativeHeapReads)
-      for (let index = offset; index < offset + length; index++)
-        if (this.defined[index] === 0)
-          throw new Error('Buriko bitmap reads unwritten native allocation');
+    if (
+      read &&
+      !this.nativeHeapReads &&
+      length !== 0 &&
+      offset + length > this.initializedPrefix &&
+      (this.defined === null ||
+        indexOfZeroByte(this.defined.subarray(offset, offset + length)) >= 0)
+    )
+      throw new Error('Buriko bitmap reads unwritten native allocation');
   }
   written(offset: number, length: number): void {
     this.range(offset, length, false);
-    if (offset === 0 && length === this.bytes.length) this.defined = null;
-    else if (this.defined !== null) {
+    if (length === 0) return;
+    if (offset === 0 && length === this.bytes.length) {
+      this.defined = null;
+      this.initializedPrefix = this.bytes.length;
+    } else if (this.defined === null) {
+      if (offset <= this.initializedPrefix)
+        this.initializedPrefix = Math.max(this.initializedPrefix, offset + length);
+      else {
+        this.defined = new Uint8Array(this.bytes.length);
+        this.defined.fill(1, 0, this.initializedPrefix);
+        this.defined.fill(1, offset, offset + length);
+      }
+    } else {
       this.defined.fill(1, offset, offset + length);
       // Sequential row/pair writes eventually initialize the entire allocation.
       // Visit each newly initialized byte once, then retire its validity map.
@@ -61,7 +82,7 @@ export class BurikoBitmapStorage {
       offset < 0 ||
       length < 0 ||
       offset + length > this.bytes.length ||
-      (this.defined !== null && offset + length > this.initializedPrefix)
+      offset + length > this.initializedPrefix
     )
       return null;
     return this.view;
@@ -74,7 +95,11 @@ export class BurikoBitmapStorage {
   initializedRange(offset: number, length: number): Uint8Array {
     this.range(offset, length, false);
     return this.defined === null
-      ? new Uint8Array(length).fill(1)
+      ? new Uint8Array(length).fill(
+          1,
+          0,
+          Math.max(0, Math.min(length, this.initializedPrefix - offset)),
+        )
       : this.defined.slice(offset, offset + length);
   }
   /** Native temporary pixel snapshots preserve unwritten bytes and their state. */
@@ -83,8 +108,8 @@ export class BurikoBitmapStorage {
     const clone = new BurikoBitmapStorage(this.bytes.slice(offset, offset + length), true);
     if (this.defined !== null) {
       clone.defined = this.defined.slice(offset, offset + length);
-      clone.initializedPrefix = Math.max(0, Math.min(length, this.initializedPrefix - offset));
     }
+    clone.initializedPrefix = Math.max(0, Math.min(length, this.initializedPrefix - offset));
     clone.nativeHeapReads = this.nativeHeapReads;
     cloneRasterText(this, clone, offset, length);
     return clone;
@@ -222,6 +247,36 @@ export function initializedBurikoBitmapView(
   const first = Math.min(bitmap.offset, lastRow);
   const end = Math.max(bitmap.offset, lastRow) + width * 4;
   return bitmap.storage?.initializedView(first, end - first) ?? null;
+}
+
+/** Checked write-only envelope; callers mark only completed rows as written. */
+export function writableBurikoBitmapView(
+  bitmap: BurikoBitmap,
+  width: number,
+  height: number,
+): DataView | null {
+  if (
+    !Number.isSafeInteger(width) ||
+    width <= 0 ||
+    !Number.isSafeInteger(height) ||
+    height <= 0 ||
+    !Number.isSafeInteger(bitmap.stride)
+  )
+    return null;
+  const lastRow = bitmap.offset + (height - 1) * bitmap.stride,
+    first = Math.min(bitmap.offset, lastRow),
+    end = Math.max(bitmap.offset, lastRow) + width * 4,
+    storage = bitmap.storage;
+  if (
+    storage === null ||
+    !Number.isSafeInteger(first) ||
+    first < 0 ||
+    !Number.isSafeInteger(end) ||
+    end > storage.bytes.length
+  )
+    return null;
+  // The empty initialized envelope checks lifetime without requiring initialized output.
+  return storage.initializedView(0, 0);
 }
 
 /** 14003e530 converts RGB888 to native 5:5:5 then fills exactly width pixels per row. */

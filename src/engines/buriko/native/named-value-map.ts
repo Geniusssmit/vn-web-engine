@@ -1,11 +1,18 @@
 import {pointerView, type BurikoBpPointer} from '../bp/memory.js';
-import {textByte, textBytes} from './text.js';
+import {determinateTextEnd, textByte, textBytes} from './text.js';
 
 /** 09db30 hashes signed bytes with wrapping DWORD arithmetic. */
 export function burikoNamedValueHash(key: BurikoBpPointer): number {
   let hash = 0;
+  const bytes = key.bytes,
+    end = determinateTextEnd(bytes, key.offset);
+  if (end >= 0) {
+    for (let offset = key.offset; offset < end; offset++)
+      hash = (Math.imul(hash, 233) + ((bytes[offset]! << 24) >> 24)) >>> 0;
+    return hash;
+  }
   for (let offset = key.offset; ; offset++) {
-    const value = textByte(key.bytes, offset);
+    const value = textByte(bytes, offset);
     if (value === 0) return hash;
     hash = (Math.imul(hash, 233) + ((value << 24) >> 24)) >>> 0;
   }
@@ -16,9 +23,18 @@ export function burikoCompareNamedBytes(
   first: BurikoBpPointer,
   second: BurikoBpPointer,
 ): -1 | 0 | 1 {
+  const left = first.bytes,
+    right = second.bytes;
+  if (determinateTextEnd(left, first.offset) >= 0 && determinateTextEnd(right, second.offset) >= 0)
+    for (let offset = 0; ; offset++) {
+      const a = left[first.offset + offset]!,
+        b = right[second.offset + offset]!;
+      if (a !== b) return a < b ? -1 : 1;
+      if (a === 0) return 0;
+    }
   for (let offset = 0; ; offset++) {
-    const a = textByte(first.bytes, first.offset + offset),
-      b = textByte(second.bytes, second.offset + offset);
+    const a = textByte(left, first.offset + offset),
+      b = textByte(right, second.offset + offset);
     if (a !== b) return a < b ? -1 : 1;
     if (a === 0) return 0;
   }
@@ -66,27 +82,29 @@ interface NamedEntry {
 /** 09def0/09dd70: the actual shared map class, separate from each consumer's registry. */
 export class BurikoNamedValueMap {
   private first: NamedEntry | null = null;
+  /** Entries by hash in list order. Lookups read the key exactly as the list walk does:
+   * one full hash pass, then comparisons against equal-hash entries only. */
+  private readonly buckets = new Map<number, NamedEntry[]>();
+  private last: NamedEntry | null = null;
   readonly valueWidth: number;
   constructor(valueWidth: number) {
     this.valueWidth = valueWidth >>> 0;
   }
 
-  private find(key: BurikoBpPointer): NamedEntry | null {
-    const hash = burikoNamedValueHash(key);
-    for (let entry = this.first; entry !== null; entry = entry.next)
-      if (entry.hash === hash && burikoCompareNamedBytes(key, entry.key) === 0) return entry;
+  private findHashed(key: BurikoBpPointer, hash: number): NamedEntry | null {
+    const bucket = this.buckets.get(hash);
+    if (bucket !== undefined)
+      for (const entry of bucket) if (burikoCompareNamedBytes(key, entry.key) === 0) return entry;
     return null;
+  }
+
+  private find(key: BurikoBpPointer): NamedEntry | null {
+    return this.findHashed(key, burikoNamedValueHash(key));
   }
 
   private insertEntry(key: BurikoBpPointer): NamedEntry {
     const hash = burikoNamedValueHash(key);
-    let previous: NamedEntry | null = null,
-      entry = this.first;
-    while (entry !== null) {
-      if (entry.hash === hash && burikoCompareNamedBytes(key, entry.key) === 0) break;
-      previous = entry;
-      entry = entry.next;
-    }
+    let entry = this.findHashed(key, hash);
     if (entry === null) {
       entry = {
         hash,
@@ -94,8 +112,12 @@ export class BurikoNamedValueMap {
         value: new NamedValue(this.valueWidth === 0 ? null : new Uint8Array(this.valueWidth)),
         next: null,
       };
-      if (previous === null) this.first = entry;
-      else previous.next = entry;
+      if (this.last === null) this.first = entry;
+      else this.last.next = entry;
+      this.last = entry;
+      const bucket = this.buckets.get(hash);
+      if (bucket === undefined) this.buckets.set(hash, [entry]);
+      else bucket.push(entry);
     }
     return entry;
   }
@@ -167,22 +189,29 @@ export class BurikoNamedValueMap {
   /** 09dce0 unlinks the first equal key before releasing its storage. */
   remove(key: BurikoBpPointer): 0 | 0x80000001 {
     const hash = burikoNamedValueHash(key);
+    const entry = this.findHashed(key, hash);
+    if (entry === null) return 0x80000001;
     let previous: NamedEntry | null = null;
-    for (let entry = this.first; entry !== null; entry = entry.next) {
-      if (entry.hash === hash && burikoCompareNamedBytes(key, entry.key) === 0) {
-        if (previous === null) this.first = entry.next;
-        else previous.next = entry.next;
-        entry.value.release();
-        return 0;
-      }
-      previous = entry;
-    }
-    return 0x80000001;
+    for (let current = this.first; current !== entry; current = current!.next) previous = current;
+    if (previous === null) this.first = entry.next;
+    else previous.next = entry.next;
+    if (this.last === entry) this.last = previous;
+    const bucket = this.buckets.get(hash)!;
+    if (bucket.length === 1) this.buckets.delete(hash);
+    else bucket.splice(bucket.indexOf(entry), 1);
+    entry.value.release();
+    return 0;
   }
 
   /** 09deb0 repeatedly removes the live head. */
   clear(): void {
-    while (this.first !== null) this.remove(this.first.key);
+    while (this.first !== null) {
+      const head = this.first;
+      this.first = head.next;
+      head.value.release();
+    }
+    this.last = null;
+    this.buckets.clear();
   }
 
   /** Used by 09db60 over the imported-language owner, whose global registry remains separate. */

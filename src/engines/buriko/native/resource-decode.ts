@@ -1,11 +1,13 @@
-import {decodeDsc} from '../../../formats/buriko/dsc.js';
-import {decodeCompressedBgLegacy, packedImage} from '../../../formats/buriko/compressed-bg.js';
+import {decodeBurikoDsc} from './dsc-wasm.js';
+import {packedImage, type BurikoImage} from '../../../formats/buriko/compressed-bg.js';
+import {decodeBurikoCompressedBgLegacyAsync} from './compressed-bg-wasm.js';
 import {signature} from '../../../formats/buriko/binary.js';
 import {decodeBurikoCompressedBgV2} from './compressed-bg-v2.js';
 import {BurikoUndefinedResourceRead, BurikoResourceCodecException} from './resource-memory.js';
 import {requireBurikoResourceRange} from './bf-entropy.js';
 import {BurikoDistributedProcessing} from './distributed-processing.js';
 import {pointerView, type BurikoBpPointer} from '../bp/memory.js';
+import {beginRuntimeSpan} from '../../../platform/runtime-performance.js';
 export {BurikoUndefinedResourceRead} from './resource-memory.js';
 
 export interface BurikoResourceDestination {
@@ -32,7 +34,9 @@ export async function decodeBurikoResourcePointer(
   mainProcessing: BurikoDistributedProcessing,
   destination: BurikoBpPointer | null,
   actor = mainProcessing.allocator.currentActor,
+  beforeResume?: () => void,
 ): Promise<BurikoResourceDecodeResult> {
+  beforeResume?.();
   const read = (offset: number): number => {
     if (source === null)
       throw new BurikoUndefinedResourceRead('Buriko resource reads a null source');
@@ -56,6 +60,7 @@ export async function decodeBurikoResourcePointer(
     destination === null ? null : {bytes: destination.bytes.subarray(destination.offset)},
     {format, rawLength: inputLength >>> 0},
     actor,
+    beforeResume,
   );
 }
 
@@ -70,7 +75,9 @@ export async function decodeBurikoResource(
   destination?: BurikoResourceDestination | null,
   nativeInput?: BurikoNativeResourceInput,
   actor = mainProcessing.allocator.currentActor,
+  beforeResume?: () => void,
 ): Promise<BurikoResourceDecodeResult> {
+  beforeResume?.();
   offset >>>= 0;
   length >>>= 0;
   const directImage =
@@ -105,7 +112,12 @@ export async function decodeBurikoResource(
         true,
       );
       if (size > 0x4000000) return {status: 6, bytes: null};
-      decoded = decodeDsc(stored);
+      const finishDecode = beginRuntimeSpan('buriko.decode.dsc');
+      try {
+        decoded = decodeBurikoDsc(stored);
+      } finally {
+        finishDecode?.({inputBytes: stored.length, outputBytes: size});
+      }
       decodedSize = decoded.length;
       initializedLength = decoded.length;
       if (decoded.length !== size) return {status: 5, bytes: null};
@@ -145,13 +157,21 @@ export async function decodeBurikoResource(
           mainProcessing.capacity,
         );
         let faulted = true;
+        const finishDecode = beginRuntimeSpan('buriko.decode.cbg-v2');
         try {
-          const resource = await decodeBurikoCompressedBgV2(stored, processing, caller, actor);
+          const resource = await decodeBurikoCompressedBgV2(
+            stored,
+            processing,
+            caller,
+            actor,
+            beforeResume,
+          );
           decoded = resource.bytes;
           initializedLength = resource.initializedLength;
           initialized = resource.initialized;
           faulted = false;
         } finally {
+          finishDecode?.({inputBytes: stored.length, success: !faulted});
           // An access fault can leave native workers inside the barrier. Preserve that original
           // fault instead of replacing it with the cleanup attempt's secondary failure.
           try {
@@ -161,7 +181,14 @@ export async function decodeBurikoResource(
           }
         }
       } else {
-        const image = decodeCompressedBgLegacy(stored, caller);
+        const finishDecode = beginRuntimeSpan('buriko.decode.cbg-legacy');
+        let image: BurikoImage;
+        try {
+          image = await decodeBurikoCompressedBgLegacyAsync(stored, caller, beforeResume);
+          beforeResume?.();
+        } finally {
+          finishDecode?.({inputBytes: stored.length});
+        }
         decoded =
           caller === undefined
             ? packedImage(image)

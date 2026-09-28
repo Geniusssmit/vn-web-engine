@@ -7,9 +7,32 @@ import type {BurikoBpThread} from './state.js';
 import type {BurikoGridEvaluationWorkers} from '../native/grid-evaluation-workers.js';
 import type {BurikoDataCodecWorkers} from '../native/data-codec-workers.js';
 import type {BurikoSharedLoaderWorker} from '../native/shared-loader-worker.js';
+import {HostTaskBudget, yieldToHost} from '../../../core/host-task-budget.js';
+import {
+  beginRuntimeSpan,
+  recordRuntimeMetric,
+  type RuntimeSpanEnd,
+} from '../../../platform/runtime-performance.js';
+import {getRuntimeProfile} from '../../../platform/runtime-profile.js';
 
 export const BURIKO_BP_BURST_INSTRUCTIONS = 0x400000;
 export type BurikoBpSchedulerResult = 0 | 1 | 2;
+
+/** Boundary samples locate instruction-heavy loops without per-instruction tracing. */
+function finishInstructionSlice(
+  finish: RuntimeSpanEnd | undefined,
+  instructions: number,
+  startPc: number,
+  thread: BurikoBpThread,
+): void {
+  finish?.({
+    instructions,
+    thread: thread.id,
+    startPc,
+    nextPc: thread.pc,
+    nextOpcode: thread.moduleMemory[thread.pc] ?? -1,
+  });
+}
 
 /** Scheduler-owned portions of native CThread; root is a non-executable list sentinel. */
 export class BurikoBpScheduledThread {
@@ -63,13 +86,35 @@ export class BurikoBpScheduledThread {
       this.process.enqueueMessage({code: 0, value1: 0, value2: 0});
       this.processStopMessagePending = false;
     }
-    const result = this.process.poll();
+    const finish = beginRuntimeSpan('buriko.process.poll-sync');
+    let result: number | Promise<number>;
+    try {
+      result = this.process.poll();
+    } finally {
+      finish?.();
+    }
+    if (typeof result !== 'number') {
+      const finishAsync = beginRuntimeSpan('buriko.process.poll-async-elapsed');
+      if (finishAsync) {
+        const settled = () => finishAsync();
+        void result.then(settled, settled);
+      }
+    }
     return typeof result === 'number'
       ? this.finishPoll(result)
       : result.then((value) => this.finishPoll(value));
   }
 
   private finishPoll(value: number): number {
+    const finish = beginRuntimeSpan('buriko.process.finish');
+    try {
+      return this.finishPollUnchecked(value);
+    } finally {
+      finish?.();
+    }
+  }
+
+  private finishPollUnchecked(value: number): number {
     const result = value | 0;
     if (result === -1 || result === 1) {
       if (this.process?.hasOutstandingExternalBorrow?.())
@@ -95,6 +140,10 @@ export class BurikoBpScheduler {
   exclusiveThread: BurikoBpScheduledThread | null = null;
   exclusiveMode = false;
   private running = false;
+  private readonly hostBudget = new HostTaskBudget();
+  private browserOptimized = false;
+  private budgetYields = 0;
+  private backgroundYields = 0;
   private invocationToken: object | null = null;
   private dispatchingInstruction: BurikoBpThread | null = null;
   private processPollToken: object | null = null;
@@ -106,6 +155,8 @@ export class BurikoBpScheduler {
   private dataCodecWorkers: BurikoDataCodecWorkers | null = null;
   private sharedLoaderWorker: BurikoSharedLoaderWorker | null = null;
   private executeInstruction: ((thread: BurikoBpThread) => BurikoBpInstructionResult) | null;
+  private batchableOpcodes: readonly boolean[] | null = null;
+  private batchableNativeSlots: readonly (readonly boolean[] | undefined)[] | null = null;
 
   constructor(
     root: BurikoBpThread,
@@ -233,12 +284,16 @@ export class BurikoBpScheduler {
   /** The aggregate installs its complete interpreter after slot factories receive this scheduler. */
   bindInstructionExecutor(
     executeInstruction: (thread: BurikoBpThread) => BurikoBpInstructionResult,
+    batchableOpcodes?: readonly boolean[],
+    batchableNativeSlots?: readonly (readonly boolean[] | undefined)[],
   ): void {
     if (this.executeInstruction !== null)
       throw new Error('Buriko scheduler instruction executor is already bound');
     if (typeof executeInstruction !== 'function')
       throw new TypeError('Buriko scheduler instruction executor must be a function');
     this.executeInstruction = executeInstruction;
+    this.batchableOpcodes = batchableOpcodes ?? null;
+    this.batchableNativeSlots = batchableOpcodes ? (batchableNativeSlots ?? null) : null;
   }
 
   get firstThread(): BurikoBpScheduledThread | null {
@@ -252,13 +307,25 @@ export class BurikoBpScheduler {
     this.gridEvaluationWorkers = workers;
   }
 
-  private yieldBackgroundWork(): Promise<void> | undefined {
+  private checkpointHostBudget(batchable = false): Promise<void> | undefined {
+    const pending = batchable ? this.hostBudget.checkpointBatched() : this.hostBudget.checkpoint();
+    if (pending !== undefined) this.budgetYields++;
+    return pending;
+  }
+
+  private yieldBackgroundWork(endOfTraversal = false): Promise<void> | undefined {
     const gridPending = this.gridEvaluationWorkers?.hasPendingWork() ?? false,
       codecPending = this.dataCodecWorkers?.hasPendingWork() ?? false,
       loaderPending = this.sharedLoaderWorker?.hasPendingWork() ?? false;
-    if (gridPending || codecPending || loaderPending)
-      return new Promise<void>((resolve) => setTimeout(resolve, 0));
-    return undefined;
+    if (
+      (gridPending || codecPending || loaderPending) &&
+      (!this.browserOptimized ||
+        (endOfTraversal && this.backgroundYields === 0 && this.budgetYields === 0))
+    ) {
+      this.backgroundYields++;
+      return yieldToHost().then(() => this.hostBudget.reset());
+    }
+    return this.checkpointHostBudget();
   }
 
   attachDataCodecWorkers(workers: BurikoDataCodecWorkers): void {
@@ -355,9 +422,23 @@ export class BurikoBpScheduler {
       throw new Error('Buriko scheduler instruction executor is not bound');
     const token = this.beginInvocation();
     this.running = true;
+    // Snapshot the shared preference once per pass. Native retains each existing
+    // background turn; the browser variant coalesces them without ending BP traversal.
+    this.browserOptimized = getRuntimeProfile() === 'browser-optimized';
+    this.budgetYields = 0;
+    this.backgroundYields = 0;
+    if (this.browserOptimized) this.hostBudget.reset();
+    const finishTiming = beginRuntimeSpan('buriko.vm.scheduler', undefined, 16);
     try {
       return await this.runInvocation(executeInstruction, token);
     } finally {
+      finishTiming?.({
+        browserOptimized: this.browserOptimized,
+        backgroundYields: this.backgroundYields,
+        budgetYields: this.budgetYields,
+      });
+      recordRuntimeMetric('buriko.vm.background-yields', this.backgroundYields);
+      recordRuntimeMetric('buriko.vm.budget-yields', this.budgetYields);
       this.running = false;
       this.endInvocation(token);
     }
@@ -367,10 +448,16 @@ export class BurikoBpScheduler {
     executeInstruction: (thread: BurikoBpThread) => BurikoBpInstructionResult,
     invocationToken: object,
   ): Promise<BurikoBpSchedulerResult> {
+    const batchableOpcodes = this.batchableOpcodes,
+      batchableNativeSlots = this.batchableNativeSlots;
     let stop = this.stopRequested;
     let condition = false;
     let node = this.root.next;
     while (node !== null) {
+      // Polls, bursts and removals end with an unbatched deadline check. Reaching the
+      // next node otherwise costs only the skip branches below, so it may amortize.
+      const pending = this.checkpointHostBudget(true);
+      if (pending !== undefined) await pending;
       if (this.exclusiveMode && node !== this.exclusiveThread) {
         node = node.next;
         continue;
@@ -381,13 +468,20 @@ export class BurikoBpScheduler {
         if (
           terminated.state.retentionCount === 0 &&
           !terminated.process?.hasOutstandingExternalBorrow?.()
-        )
+        ) {
           this.remove(terminated);
+          const pending = this.checkpointHostBudget();
+          if (pending !== undefined) await pending;
+        }
         continue;
       }
       if ((node.flags & 1) !== 0) {
         const pollResult = node.pollProcess(stop, invocationToken);
         const processResult = typeof pollResult === 'number' ? pollResult : await pollResult;
+        // A completed process can do substantial work before releasing this child.
+        // Service the host before starting an instruction on the same child.
+        const pending = this.checkpointHostBudget();
+        if (pending !== undefined) await pending;
         if (processResult === 0 || processResult === -1) {
           if (processResult === -1) stop = true;
           node = node.next;
@@ -400,17 +494,57 @@ export class BurikoBpScheduler {
         continue;
       }
       let result: BurikoBpHandlerResult = 0;
-      for (let count = 0; count < BURIKO_BP_BURST_INSTRUCTIONS; count++) {
-        let instruction: BurikoBpInstructionResult;
-        this.dispatchingInstruction = node.state;
-        try {
-          instruction = executeInstruction(node.state);
-        } finally {
-          // A returned Promise keeps its callback lease, but cannot admit a new callback.
-          this.dispatchingInstruction = null;
+      let finishSlice = beginRuntimeSpan('buriko.vm.sync-slice');
+      let sliceInstructions = 0;
+      let sliceStartPc = node.state.pc;
+      try {
+        for (let count = 0; count < BURIKO_BP_BURST_INSTRUCTIONS; count++) {
+          let instruction: BurikoBpInstructionResult;
+          let batchable = false;
+          if (batchableOpcodes !== null) {
+            const code = node.state.moduleMemory,
+              pc = node.state.pc,
+              opcode = code[pc]!;
+            // Native slots are selected by the secondary byte that follows the primary.
+            batchable =
+              batchableOpcodes[opcode] === true ||
+              batchableNativeSlots?.[opcode]?.[code[(pc + 1) >>> 0]!] === true;
+          }
+          this.dispatchingInstruction = node.state;
+          try {
+            sliceInstructions++;
+            instruction = executeInstruction(node.state);
+          } finally {
+            // A returned Promise keeps its callback lease, but cannot admit a new callback.
+            this.dispatchingInstruction = null;
+          }
+          if (typeof instruction === 'number') result = instruction;
+          else {
+            batchable = false;
+            finishInstructionSlice(finishSlice, sliceInstructions, sliceStartPc, node.state);
+            finishSlice = undefined;
+            result = await instruction;
+            sliceInstructions = 0;
+            sliceStartPc = node.state.pc;
+            finishSlice = beginRuntimeSpan('buriko.vm.sync-slice');
+          }
+          if (result !== 0) break;
+          // Host time slicing retains the native burst count and selected BP child.
+          // Only proven small synchronous instructions may amortize clock reads.
+          // Native work and Promise settlement still check the deadline at once;
+          // settlement does not reset it or service host tasks.
+          const pending = this.checkpointHostBudget(batchable);
+          if (pending !== undefined) {
+            finishInstructionSlice(finishSlice, sliceInstructions, sliceStartPc, node.state);
+            finishSlice = undefined;
+            await pending;
+            sliceInstructions = 0;
+            sliceStartPc = node.state.pc;
+            finishSlice = beginRuntimeSpan('buriko.vm.sync-slice');
+          }
         }
-        result = typeof instruction === 'number' ? instruction : await instruction;
-        if (result !== 0) break;
+      } finally {
+        finishInstructionSlice(finishSlice, sliceInstructions, sliceStartPc, node.state);
       }
       switch (result) {
         case 0:
@@ -442,7 +576,7 @@ export class BurikoBpScheduler {
       if (work !== undefined) await work;
     }
     // An invocation that only polled waiting processes still cannot starve a native worker.
-    const work = this.yieldBackgroundWork();
+    const work = this.yieldBackgroundWork(true);
     if (work !== undefined) await work;
     return stop ? 1 : condition ? 2 : 0;
   }

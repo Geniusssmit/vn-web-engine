@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {allocateBurikoBitmap, fillBurikoBitmap} from '../dist/engines/buriko/native/bitmap.js';
+import {
+  allocateBurikoBitmap,
+  fillBurikoBitmap,
+  BurikoBitmapStorage,
+} from '../dist/engines/buriko/native/bitmap.js';
 import {bitmapRead32, bitmapWrite32} from '../dist/engines/buriko/native/bitmap-scalar.js';
 import {mixBurikoBitmaps} from '../dist/engines/buriko/native/bitmap-mix.js';
 import {
@@ -56,6 +60,95 @@ test('native alpha mixing weights colors by coverage and retains reciprocal-tabl
   assert.equal(result[0], 0xff7d7c7a);
   assert.equal(result[1], 0x807b7c7c);
   assert.equal(result[2], 0x00012345);
+});
+
+test('sprite mixing preserves all alpha pairs and native quantization across changing factors', () => {
+  // All alpha pairs, then every four-pixel arrangement of binary coverage.
+  // Padded rows and the final single-pixel tail retain their native traversal.
+  const create = () => ({...allocateBurikoBitmap(260, 261, 2), width: 257}),
+    first = create(),
+    second = create(),
+    output = create(),
+    expected = create();
+  for (let a = 0; a < first.height; a++)
+    for (let b = 0; b < first.width; b++) {
+      const offset = a * first.stride + b * 4,
+        binaryIndex = (a - 256) * first.width + b,
+        arrangement = binaryIndex >>> 2,
+        lane = (binaryIndex & 3) * 2,
+        firstAlpha = a < 256 ? a & 255 : ((arrangement >>> lane) & 1) * 255,
+        secondAlpha = a < 256 ? b & 255 : ((arrangement >>> (lane + 1)) & 1) * 255;
+      first.storage.view.setUint32(offset, (firstAlpha << 24) | 0x00ff80, true);
+      second.storage.view.setUint32(offset, (secondAlpha << 24) | 0xff007f, true);
+    }
+  first.storage.written(0, first.storage.bytes.length);
+  second.storage.written(0, second.storage.bytes.length);
+  const checkedFirst = {
+    ...first,
+    storage: new BurikoBitmapStorage(first.storage.bytes.slice(), true),
+  };
+  checkedFirst.storage.initializedView = () => null;
+  for (const factor of [0, 1, 63, 127, 128, 129, 255, 256, 128]) {
+    mixBurikoBitmaps(expected, checkedFirst, second, factor, null, 0);
+    mixBurikoBitmaps(output, first, second, factor, null, 0);
+    assert.deepEqual(output.storage.bytes, expected.storage.bytes, `factor ${factor}`);
+  }
+});
+
+test('sprite mixing retains alias traversal, unwritten faults, and partial output validity', () => {
+  function run(format, configure, checked, factor) {
+    const bytes = Uint8Array.from({length: 160}, (_, index) => (index * 67) & 255),
+      storage = new BurikoBitmapStorage(bytes, true),
+      first = {storage, offset: 8, stride: 32, width: 5, height: 3, format, bytesPerPixel: 4},
+      second = {...first, offset: 12},
+      output = {...first, offset: 16};
+    configure(first, second, output);
+    if (checked) first.storage.initializedView = () => null;
+    let error;
+    try {
+      mixBurikoBitmaps(output, first, second, factor, null, 0);
+    } catch (failure) {
+      error = failure.message;
+    }
+    return {
+      bytes: output.storage.bytes,
+      validity: output.storage.initializedRange(0, output.storage.bytes.length),
+      error,
+    };
+  }
+  const cases = [
+    () => {},
+    (first, second, output) => {
+      output.offset = first.offset;
+      output.stride = 28;
+    },
+    (first, second, output) => {
+      first.offset = 80;
+      first.stride = -32;
+      output.offset = 100;
+      output.stride = -32;
+    },
+    (first, second, output) => {
+      output.storage = new BurikoBitmapStorage(new Uint8Array(120), false);
+      output.offset = 4;
+      output.stride = 32;
+    },
+    (first, second, output) => {
+      first.storage = new BurikoBitmapStorage(first.storage.bytes.slice(), false);
+      first.storage.written(first.offset, 8);
+      output.storage = new BurikoBitmapStorage(new Uint8Array(160), false);
+    },
+    (first, second, output) => {
+      output.offset = 120;
+    },
+  ];
+  for (const format of [1, 2])
+    for (const factor of [129, 256])
+      for (const configure of cases)
+        assert.deepEqual(
+          run(format, configure, false, factor),
+          run(format, configure, true, factor),
+        );
 });
 
 test('bitmap operation strips use actual worker capacity and complete every normal draw job', () => {

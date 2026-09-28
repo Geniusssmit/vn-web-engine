@@ -32,3 +32,127 @@ test('half reduction honors a smaller destination and includes the RGB fourth by
   reduceBurikoBitmapHalf(destination, source);
   assert.deepEqual(destination.storage.bytes, bitmap(2, 1, [2, 14], 1).storage.bytes);
 });
+
+const descriptor = (storage, width, height, stride, offset = 0) => ({
+  storage,
+  offset,
+  stride,
+  width,
+  height,
+  format: 2,
+  bytesPerPixel: 4,
+});
+const pattern = (size) => Uint8Array.from({length: size}, (_, index) => (index * 73 + 129) & 255);
+
+test('checked reduction retains stride, pair aliasing, odd-edge and destination validity behavior', () => {
+  for (const [sourceStride, sourceOffset, destinationStride, destinationOffset, alias] of [
+    [40, 4, 24, 8, false],
+    [40, 4, 24, 8, true],
+    [40, 4, 24, 20, true],
+    [40, 4, -24, 80, true],
+    [-40, 164, 24, 8, true],
+  ]) {
+    const create = (scalar) => {
+      const bytes = pattern(256),
+        sourceStorage = scalar
+          ? BurikoBitmapStorage.tracked(bytes, new Uint8Array(bytes.length).fill(1))
+          : new BurikoBitmapStorage(bytes, true),
+        destinationStorage = alias
+          ? sourceStorage
+          : new BurikoBitmapStorage(new Uint8Array(128).fill(0xcc), false);
+      // Keep the checked traversal as an independent reference even when tracked
+      // validity imports establish the same contiguous initialization proof.
+      if (scalar) sourceStorage.initializedView = () => null;
+      return {
+        source: descriptor(sourceStorage, 9, 5, sourceStride, sourceOffset),
+        destination: descriptor(destinationStorage, 6, 4, destinationStride, destinationOffset),
+      };
+    };
+    const checked = create(false),
+      scalar = create(true);
+    reduceBurikoBitmapHalf(checked.destination, checked.source);
+    reduceBurikoBitmapHalf(scalar.destination, scalar.source);
+    assert.deepEqual(checked.destination.storage.bytes, scalar.destination.storage.bytes);
+    assert.deepEqual(
+      checked.destination.storage.initializedRange(0, checked.destination.storage.bytes.length),
+      scalar.destination.storage.initializedRange(0, scalar.destination.storage.bytes.length),
+    );
+    if (!alias) {
+      const initialized = new Uint8Array(128);
+      for (let row = 0; row < 3; row++) initialized.fill(1, 8 + row * 24, 28 + row * 24);
+      assert.deepEqual(checked.destination.storage.initializedRange(0, 128), initialized);
+      assert.equal(checked.destination.storage.bytes[28], 0xcc, 'row padding remains untouched');
+    }
+  }
+});
+
+test('large reduction retains byte rounding, odd tails and padding across RGB and RGBA planes', () => {
+  for (const [width, height, destinationWidth, destinationHeight, format] of [
+    [129, 131, 67, 67, 1],
+    [130, 132, 65, 66, 2],
+    [137, 133, 63, 65, 2],
+  ]) {
+    const sourceStride = width * 4 + 12,
+      destinationStride = destinationWidth * 4 + 20,
+      create = (scalar) => {
+        const bytes = pattern(sourceStride * height + 4),
+          sourceStorage = scalar
+            ? BurikoBitmapStorage.tracked(bytes, new Uint8Array(bytes.length).fill(1))
+            : new BurikoBitmapStorage(bytes, true),
+          destinationStorage = new BurikoBitmapStorage(
+            new Uint8Array(destinationStride * destinationHeight + 8).fill(0xcc),
+            false,
+          );
+        if (scalar) sourceStorage.initializedView = () => null;
+        return {
+          source: {...descriptor(sourceStorage, width, height, sourceStride, 4), format},
+          destination: {
+            ...descriptor(
+              destinationStorage,
+              destinationWidth,
+              destinationHeight,
+              destinationStride,
+              8,
+            ),
+            format,
+          },
+        };
+      };
+    const accelerated = create(false),
+      scalar = create(true);
+    reduceBurikoBitmapHalf(accelerated.destination, accelerated.source);
+    reduceBurikoBitmapHalf(scalar.destination, scalar.source);
+    assert.deepEqual(accelerated.destination.storage.bytes, scalar.destination.storage.bytes);
+    assert.deepEqual(
+      accelerated.destination.storage.initializedRange(
+        0,
+        accelerated.destination.storage.bytes.length,
+      ),
+      scalar.destination.storage.initializedRange(0, scalar.destination.storage.bytes.length),
+    );
+  }
+});
+
+test('reduction keeps scalar fault order and partial initialization for sparse or malformed spans', () => {
+  const validity = new Uint8Array(64).fill(1);
+  validity[20] = 0;
+  const sparse = descriptor(BurikoBitmapStorage.tracked(pattern(64), validity), 8, 2, 32),
+    destination = descriptor(new BurikoBitmapStorage(new Uint8Array(16), false), 4, 1, 16);
+  assert.throws(() => reduceBurikoBitmapHalf(destination, sparse), /unwritten native allocation/);
+  assert.deepEqual(
+    destination.storage.initializedRange(0, 16),
+    Uint8Array.from({length: 16}, (_, index) => Number(index < 8)),
+    'both pixels from the first pair commit before a later source fault',
+  );
+
+  const source = descriptor(new BurikoBitmapStorage(pattern(64), true), 8, 2, 32),
+    short = descriptor(new BurikoBitmapStorage(new Uint8Array(12), false), 4, 1, 16);
+  assert.throws(() => reduceBurikoBitmapHalf(short, source), /outside native allocation/);
+  assert.deepEqual(short.storage.initializedRange(0, 12), new Uint8Array(12).fill(1));
+  const complete = descriptor(new BurikoBitmapStorage(new Uint8Array(16), false), 4, 1, 16);
+  reduceBurikoBitmapHalf(complete, source);
+  assert.deepEqual(short.storage.bytes, complete.storage.bytes.subarray(0, 12));
+  assert.deepEqual(destination.storage.bytes.subarray(0, 8), complete.storage.bytes.subarray(0, 8));
+  source.storage.release();
+  assert.throws(() => reduceBurikoBitmapHalf(complete, source), /released native allocation/);
+});

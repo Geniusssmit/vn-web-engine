@@ -1,3 +1,5 @@
+import {beginRuntimeSpan, recordRuntimeMetric} from './runtime-performance.js';
+
 /** Transactional byte records, shared by files and the virtual registry. */
 export interface RecordStore {
   snapshot(): Promise<Map<string, Uint8Array>>;
@@ -20,6 +22,21 @@ function changed(
       throw new Error('Invalid storage record');
   return copy(records); // Do not retain references supplied to or retained by the callback.
 }
+
+/** Exact equality without a callback for every byte of a large unchanged record. */
+function equalBytes(first: Uint8Array, second: Uint8Array): boolean {
+  if (first.length !== second.length) return false;
+  let byte = 0;
+  if (((first.byteOffset | second.byteOffset) & 3) === 0) {
+    const count = Math.floor(first.length / 4),
+      left = new Uint32Array(first.buffer, first.byteOffset, count),
+      right = new Uint32Array(second.buffer, second.byteOffset, count);
+    for (let word = 0; word < count; word++) if (left[word] !== right[word]) return false;
+    byte = count * 4;
+  }
+  for (; byte < first.length; byte++) if (first[byte] !== second[byte]) return false;
+  return true;
+}
 export class MemoryStore implements RecordStore {
   private records = new Map<string, Uint8Array>();
   private closed = false;
@@ -39,11 +56,45 @@ export class MemoryStore implements RecordStore {
   }
 }
 
-/** One database per application/game/profile. Never falls back to transient storage. */
+/** Stores in this realm, by database name, for synchronous cache invalidation after a commit. */
+const openStores = new Map<string, Set<IndexedDbStore>>();
+
+/**
+ * One database per application/game/profile. Never falls back to transient storage.
+ *
+ * Snapshots are served from the last committed state this instance observed. A commit by any
+ * instance invalidates the others: synchronously within this realm, and through a
+ * BroadcastChannel for other tabs and workers. Updates always read the database inside their
+ * readwrite transaction, so cross-tab writes still serialize. Snapshot values are shared with
+ * the cache and must be treated as read-only.
+ */
 export class IndexedDbStore implements RecordStore {
   private closed = false;
+  private cache: Map<string, Uint8Array> | null = null;
+  /** Advances on every invalidation; a read may populate the cache only if it is unchanged. */
+  private generation = 0;
+  private readonly channel: BroadcastChannel | null;
   private constructor(private readonly db: IDBDatabase) {
     db.onversionchange = () => this.close();
+    let peers = openStores.get(db.name);
+    if (peers === undefined) openStores.set(db.name, (peers = new Set()));
+    peers.add(this);
+    this.channel =
+      typeof BroadcastChannel === 'undefined'
+        ? null
+        : new BroadcastChannel(`vn-runtime-store:${db.name}`);
+    if (this.channel !== null) this.channel.onmessage = () => this.invalidate();
+  }
+  private invalidate(): void {
+    this.cache = null;
+    this.generation++;
+  }
+  /** Runs when a readwrite transaction has committed `records` as the complete database state. */
+  private committed(records: Map<string, Uint8Array>): void {
+    for (const peer of openStores.get(this.db.name) ?? []) if (peer !== this) peer.invalidate();
+    this.channel?.postMessage(null);
+    this.generation++;
+    this.cache = records;
   }
   static open(
     namespace: readonly string[],
@@ -73,52 +124,138 @@ export class IndexedDbStore implements RecordStore {
     change?: (records: Map<string, Uint8Array>) => void,
   ): Promise<Map<string, Uint8Array>> {
     if (this.closed) return Promise.reject(new Error('Storage is closed'));
+    const finishTransaction = beginRuntimeSpan('storage.idb.transaction');
+    const generation = this.generation;
     return new Promise((resolve, reject) => {
-      const tx = this.db.transaction('records', change ? 'readwrite' : 'readonly');
-      const store = tx.objectStore('records'),
-        records = new Map<string, Uint8Array>();
+      const records = new Map<string, Uint8Array>();
       let failure: unknown,
-        result = records;
-      tx.onabort = () => reject(failure ?? tx.error ?? new Error('Storage transaction aborted'));
-      tx.onerror = () => {
-        /* Abort reports the transaction failure; never cancel it. */
+        result = records,
+        readBytes = 0,
+        copiedBytes = 0,
+        comparedBytes = 0,
+        writes = 0,
+        writeBytes = 0,
+        deletes = 0;
+      const finish = (aborted: boolean): void => {
+        if (!finishTransaction) return;
+        finishTransaction({
+          update: !!change,
+          aborted,
+          records: records.size,
+          readBytes,
+          copiedBytes,
+          comparedBytes,
+          writes,
+          deletes,
+        });
+        recordRuntimeMetric('storage.idb.read-bytes', readBytes);
+        recordRuntimeMetric('storage.idb.copy-bytes', copiedBytes);
+        recordRuntimeMetric('storage.idb.compare-bytes', comparedBytes);
+        recordRuntimeMetric('storage.idb.write-bytes', writeBytes);
       };
-      tx.oncomplete = () => resolve(result);
-      const cursor = store.openCursor();
-      cursor.onsuccess = () => {
-        try {
-          const row = cursor.result;
-          if (row) {
-            if (typeof row.key !== 'string' || !(row.value instanceof Uint8Array))
-              throw new Error('Corrupt storage record');
-            records.set(row.key, row.value);
-            row.continue();
-            return;
+      try {
+        const tx = this.db.transaction('records', change ? 'readwrite' : 'readonly');
+        const store = tx.objectStore('records');
+        tx.onabort = () => {
+          finish(true);
+          reject(failure ?? tx.error ?? new Error('Storage transaction aborted'));
+        };
+        tx.onerror = () => {
+          /* Abort reports the transaction failure; never cancel it. */
+        };
+        tx.oncomplete = () => {
+          finish(false);
+          if (change) this.committed(result);
+          else if (generation === this.generation && !this.closed) this.cache = result;
+          resolve(change || this.cache !== result ? result : new Map(result));
+        };
+        const cursor = store.openCursor();
+        cursor.onsuccess = () => {
+          try {
+            const finishCursor = beginRuntimeSpan('storage.idb.cursor-sync');
+            let more = false,
+              rowBytes = 0;
+            try {
+              const row = cursor.result;
+              if (row) {
+                const key = row.key,
+                  value = row.value;
+                if (typeof key !== 'string' || !(value instanceof Uint8Array))
+                  throw new Error('Corrupt storage record');
+                rowBytes = value.byteLength;
+                readBytes += rowBytes;
+                records.set(key, value);
+                more = true;
+                row.continue();
+              }
+            } finally {
+              finishCursor?.({records: Number(more), bytes: rowBytes});
+            }
+            if (more || !change) return;
+            // Read and modify inside ONE readwrite transaction: updates from other tabs serialize.
+            const finishApply = beginRuntimeSpan('storage.idb.apply-copy-sync');
+            try {
+              const input = copy(records);
+              copiedBytes = readBytes;
+              result = changed(input, change);
+              if (finishTransaction)
+                for (const bytes of result.values()) copiedBytes += bytes.byteLength;
+            } finally {
+              finishApply?.({records: result.size, copiedBytes});
+            }
+            const finishCompare = beginRuntimeSpan('storage.idb.compare-sync');
+            let comparedRecords = 0;
+            try {
+              for (const key of records.keys())
+                if (!result.has(key)) {
+                  store.delete(key);
+                  deletes++;
+                }
+              for (const [key, bytes] of result) {
+                const old = records.get(key);
+                if (old && old.length === bytes.length) {
+                  comparedRecords++;
+                  comparedBytes += bytes.byteLength;
+                }
+                if (!old || !equalBytes(old, bytes)) {
+                  store.put(bytes, key);
+                  writes++;
+                  writeBytes += bytes.byteLength;
+                }
+              }
+            } finally {
+              // Byte totals describe comparison inputs; mismatches can exit early.
+              finishCompare?.({records: comparedRecords, bytes: comparedBytes, writes, deletes});
+            }
+          } catch (error) {
+            failure = error;
+            tx.abort();
           }
-          if (!change) return;
-          // Read and modify inside ONE readwrite transaction: updates from other tabs serialize.
-          result = changed(copy(records), change);
-          for (const key of records.keys()) if (!result.has(key)) store.delete(key);
-          for (const [key, bytes] of result) {
-            const old = records.get(key);
-            if (!old || old.length !== bytes.length || old.some((b, i) => b !== bytes[i]))
-              store.put(bytes, key);
-          }
-        } catch (error) {
-          failure = error;
-          tx.abort();
-        }
-      };
+        };
+      } catch (error) {
+        finish(true);
+        reject(error);
+      }
     });
   }
   snapshot(): Promise<Map<string, Uint8Array>> {
+    if (this.closed) return Promise.reject(new Error('Storage is closed'));
+    if (this.cache !== null) {
+      recordRuntimeMetric('storage.idb.cached-snapshots', 1);
+      return Promise.resolve(new Map(this.cache));
+    }
     return this.transaction();
   }
   async update(change: (records: Map<string, Uint8Array>) => void): Promise<void> {
     await this.transaction(change);
   }
   close(): void {
+    if (this.closed) return;
     this.closed = true;
+    this.invalidate();
+    openStores.get(this.db.name)?.delete(this);
+    if (openStores.get(this.db.name)?.size === 0) openStores.delete(this.db.name);
+    this.channel?.close();
     this.db.close();
   }
 }
