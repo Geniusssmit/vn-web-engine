@@ -21,7 +21,7 @@ export class BurikoNativeFile {
   constructor(readonly files: BurikoProgramFiles) {}
 
   private pathname(path: BurikoBpPointer): {bytes: Uint8Array; wide: string; identity: string} {
-    const bytes = textBytes(path, true),
+    const bytes = textBytes(path, true).slice(),
       wide = this.files.path(bytes);
     if (wide.length > 783)
       throw new RangeError('Buriko native file path exceeds its wide stack record');
@@ -167,7 +167,7 @@ export class BurikoNativeFile {
     count >>>= 0;
     if (this.output === null || count === 0) return 0;
     const input = pointerView(source, count);
-    requireDeterminateMemory(source.bytes, source.offset, count);
+    requireDeterminateMemory(source.view(), source.offset, count);
     const transferred = await this.output.write(
       new Uint8Array(input.buffer, input.byteOffset, input.byteLength),
     );

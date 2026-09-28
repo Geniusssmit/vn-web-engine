@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {pop32} from '../dist/engines/buriko/bp/state.js';
+import {hostPointer} from '../dist/engines/buriko/bp/memory.js';
 import {createMountedVmFixture} from './aokana-production-vm-fixture.mjs';
 
 test('mounted text layout settings clone overlay frames and share reading font policy', async () => {
@@ -45,8 +46,11 @@ test('mounted text layout settings clone overlay frames and share reading font p
     await call(0x90, 0x13, [5, 0xff804020]);
     await call(0x90, 0x11, [6, 1, 3, 1]);
     await call(0x90, 0x13, [6, 0x102030]);
-    const bp = new DataView(memory.globalMemory.buffer);
-    [5, 0xffffffff, 6].forEach((id, index) => bp.setUint32(0x100 + index * 4, id, true));
+    const bp = () => {
+      const bank = memory.globalMemory;
+      return new DataView(bank.buffer, bank.byteOffset, bank.byteLength);
+    };
+    [5, 0xffffffff, 6].forEach((id, index) => bp().setUint32(0x100 + index * 4, id, true));
     await call(0x90, 0x98, [3, 0x100]);
     assert.equal(state.overlayFrameCount, 3);
     assert.deepEqual(
@@ -77,7 +81,7 @@ test('mounted text layout settings clone overlay frames and share reading font p
     assert.ok(font >= 0);
     await call(0x91, 0x97, [font, 9, 80, 2, 3]);
     assert.deepEqual(fields(), [9, 80, 2, 3, 0xffffffff, 0xffffffff]);
-    assert.equal(graph.text.decodeAuto({bytes: state.readingFontName, offset: 0}), 'Shared');
+    assert.equal(graph.text.decodeAuto(hostPointer(state.readingFontName)), 'Shared');
     await call(0x92, 0x97, [font, 10, 75, 4, 5, 0x123456, 0xabcdef]);
     assert.deepEqual(fields(), [10, 75, 4, 5, 0x123456, 0xabcdef]);
     await call(0x90, 0x98, [0, 0]);

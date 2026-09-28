@@ -1,6 +1,6 @@
 import {FileError} from '../../../platform/filesystem.js';
 import type {BurikoBpModuleResourceSource} from './types.js';
-import {pointerView, type BurikoBpPointer} from '../bp/memory.js';
+import {hostPointer, pointerView, type BurikoBpPointer} from '../bp/memory.js';
 import {BurikoProgramArchives, type BurikoArchiveResource} from './program-archives.js';
 import {BurikoProgramFiles, terminatedNativeBytes} from './program-files.js';
 import {BurikoEngineDialogs, BurikoNativeExit} from './engine-dialogs.js';
@@ -10,7 +10,14 @@ import {
   type BurikoResourceDestination,
 } from './resource-decode.js';
 import {assertBurikoPathDomain} from './path-domain.js';
-import {textBytes, textLength, writeText} from './text.js';
+import {
+  nativeStringBytes,
+  scanText,
+  textBytes,
+  textLength,
+  writeText,
+  type BurikoNativeString,
+} from './text.js';
 import {BurikoEngineErrors} from './engine-errors.js';
 import type {BurikoDistributedProcessing} from './distributed-processing.js';
 import type {BurikoSelectionDialog} from './selection-dialog.js';
@@ -23,10 +30,18 @@ function bounded(path: string, capacity = 784, checkDomain = true): string {
 }
 
 /** Native archive pointers are not dereferenced when primary loose lookup succeeds. */
-export type BurikoArchiveName = Uint8Array | (() => Uint8Array);
+export type BurikoArchiveName = BurikoNativeString;
 
 function archiveBytes(archive: BurikoArchiveName): Uint8Array {
   return typeof archive === 'function' ? archive() : archive;
+}
+
+/** `terminatedNativeBytes` of a name; a result that aliases caller storage is resolved per call. */
+function terminatedName(name: BurikoNativeString): () => Uint8Array {
+  const bytes = nativeStringBytes(name),
+    terminated = terminatedNativeBytes(bytes);
+  if (typeof name !== 'function' || bytes.indexOf(0) < 0) return () => terminated;
+  return () => terminatedNativeBytes(name());
 }
 
 export interface BurikoProgramResourceConfiguration {
@@ -77,7 +92,7 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
     encoded[original.length] = 92;
     // The native sprintf always appends a slash, even to a caller's trailing slash.
     this.configuration.primaryRoot = encoded;
-    const decoded = this.files.text.decodeAuto({bytes: encoded, offset: 0});
+    const decoded = this.files.text.decodeAuto(hostPointer(encoded));
     if (decoded.length >= 784)
       throw new RangeError('Buriko primary root exceeds native wide buffer');
     this.configuration.nativeFileRoot = decoded;
@@ -85,7 +100,7 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
   }
 
   private convert(bytes: Uint8Array, mode: number): Uint8Array {
-    return this.files.text.convertEncoding({bytes: terminatedNativeBytes(bytes), offset: 0}, mode);
+    return this.files.text.convertEncoding(hostPointer(terminatedNativeBytes(bytes)), mode);
   }
 
   private concatenate(
@@ -94,8 +109,8 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
     separator: boolean,
     capacity: number,
   ): Uint8Array {
-    const a = textBytes({bytes: first, offset: 0});
-    const b = textBytes({bytes: second, offset: 0}, true);
+    const a = textBytes(hostPointer(first));
+    const b = textBytes(hostPointer(second), true);
     const length = a.length + Number(separator) + b.length;
     if (length > capacity)
       throw new RangeError('Buriko native resource path exceeds scratch storage');
@@ -147,19 +162,26 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
       undefined,
       actor,
     );
-    return {result: decoded.status, bytes: decoded.bytes, initialized: decoded.initialized};
+    return {
+      result: decoded.status,
+      get bytes() {
+        return decoded.bytes;
+      },
+      initialized: decoded.initialized,
+    };
   }
 
   private async loose(
     root: Uint8Array,
-    name: Uint8Array,
+    name: BurikoNativeString,
     destination?: BurikoResourceDestination | null,
     actor = this.mainProcessing.allocator.currentActor,
   ): Promise<BurikoArchiveResource | null> {
-    const terminated = terminatedNativeBytes(name);
-    const absolute = terminated[0] === 92 || terminated[1] === 58;
+    const terminated = terminatedName(name),
+      initial = terminated();
+    const absolute = initial[0] === 92 || initial[1] === 58;
     let result = await this.looseFile(
-      absolute ? terminated : this.loosePath(root, terminated),
+      absolute ? initial : this.loosePath(root, initial),
       0,
       0,
       destination,
@@ -168,7 +190,7 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
     if (!absolute && result.result === 1 && this.configuration.searchDirectoriesEnabled !== 0) {
       for (const directory of this.configuration.searchDirectories) {
         result = await this.looseFile(
-          this.loosePath(this.loosePath(root, directory), terminated, true),
+          this.loosePath(this.loosePath(root, directory), terminated(), true),
           0,
           0,
           destination,
@@ -179,7 +201,13 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
     }
     // bda60 collapses every loose decoder failure (including empty files) into size zero.
     return result.result === 0 && result.bytes !== null && result.bytes.length !== 0
-      ? {result: result.bytes.length, bytes: result.bytes, initialized: result.initialized}
+      ? {
+          result: result.bytes.length,
+          get bytes() {
+            return result.bytes;
+          },
+          initialized: result.initialized,
+        }
       : null;
   }
 
@@ -200,7 +228,7 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
       for (const name of names) value = (value + name.length) >>> 0;
     } else {
       for (const name of names) {
-        writeText({bytes: packedNames.bytes, offset: packedNames.offset + value}, name);
+        writeText(packedNames.add(value), name);
         value = (value + name.length) >>> 0;
       }
       value = names.length >>> 0;
@@ -226,7 +254,7 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
     const list = new Uint8Array(Math.imul(names.length, 0x60) >>> 0);
     let offset = 0;
     for (const name of names) {
-      const bytes = textBytes({bytes: name, offset: 0});
+      const bytes = textBytes(hostPointer(name));
       if (offset + bytes.length + 2 > list.length)
         throw new RangeError('Buriko archive selection list exceeds its native allocation');
       list.set(bytes, offset);
@@ -234,7 +262,7 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
       list[offset++] = 10;
       list[offset] = 0;
     }
-    return (await selection.select(output, title, prompt, {bytes: list, offset: 0})) === 0
+    return (await selection.select(output, title, prompt, hostPointer(list))) === 0
       ? 0xffffffff
       : 0;
   }
@@ -255,13 +283,11 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
     return result === 0 ? 0 : 1;
   }
 
-  private async retry(archive: BurikoArchiveName | null, name: Uint8Array): Promise<void> {
+  private async retry(archive: BurikoArchiveName | null, name: BurikoNativeString): Promise<void> {
     // bd7d0 prepares its error text before bbc90 decides between a fatal error and a media dialog.
     const diagnosticArchive = archive === null ? null : archiveBytes(archive);
-    if (
-      textLength({bytes: terminatedNativeBytes(this.configuration.secondaryRoot), offset: 0}) === 0
-    ) {
-      const resource = this.files.path(name);
+    if (textLength(hostPointer(terminatedNativeBytes(this.configuration.secondaryRoot))) === 0) {
+      const resource = this.files.path(nativeStringBytes(name));
       const item =
         diagnosticArchive === null
           ? resource
@@ -305,7 +331,7 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
   /** 1400bd7d0: primary loose, then secondary loose OR the archive/cache fallback loop. */
   async load(
     archive: BurikoArchiveName | null,
-    name: Uint8Array,
+    name: BurikoNativeString,
     retry: boolean,
     destination?: BurikoResourceDestination | null,
     actor = this.mainProcessing.allocator.currentActor,
@@ -355,19 +381,20 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
   /** BBD80/BC030 preserve decoder statuses for the BBAB0 partial-load path. */
   async partialLoose(
     root: Uint8Array | null,
-    name: Uint8Array,
+    name: BurikoNativeString,
     offset: number,
     length: number,
     destination?: BurikoResourceDestination | null,
     actor = this.mainProcessing.allocator.currentActor,
   ): Promise<BurikoArchiveResource> {
-    const terminated = terminatedNativeBytes(name);
-    if (terminated[0] === 92 || terminated[1] === 58)
-      return this.looseFile(terminated, offset, length, destination, actor);
+    const terminated = terminatedName(name),
+      initial = terminated();
+    if (initial[0] === 92 || initial[1] === 58)
+      return this.looseFile(initial, offset, length, destination, actor);
     if (root === null)
       throw new Error('Buriko relative loose resource path converts a null native root');
     let result = await this.looseFile(
-      this.loosePath(root, terminated),
+      this.loosePath(root, initial),
       offset,
       length,
       destination,
@@ -377,7 +404,7 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
       for (const directory of this.configuration.searchDirectories) {
         if (result.result !== 1) break;
         result = await this.looseFile(
-          this.loosePath(this.loosePath(root, directory), terminated, true),
+          this.loosePath(this.loosePath(root, directory), terminated(), true),
           offset,
           length,
           destination,
@@ -390,7 +417,7 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
   /** BBAB0: primary loose, then secondary loose or archive fallback; success is status zero. */
   async loadPartial(
     archive: BurikoArchiveName | null,
-    name: Uint8Array,
+    name: BurikoNativeString,
     offset: number,
     length: number,
     destination?: BurikoResourceDestination | null,
@@ -414,9 +441,9 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
         destination,
         actor,
       );
-    const archiveName = archiveBytes(archive);
+    archiveBytes(archive);
     const path = (root: Uint8Array): Uint8Array => {
-      const value = this.archivePath(root, archiveName);
+      const value = this.archivePath(root, archiveBytes(archive));
       if (value.length > 784)
         throw new RangeError('Buriko partial resource archive path exceeds native scratch');
       return value;
@@ -481,20 +508,20 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
 
   /** BA330: raw entry, independent physical-name lookup, then independent payload base. */
   async locateArchiveEntry(
-    archive: Uint8Array,
-    name: Uint8Array,
+    archive: BurikoNativeString,
+    name: BurikoNativeString,
   ): Promise<{
     path: Uint8Array;
     record: Uint8Array;
   } | null> {
     const configuration = this.configuration;
-    let path = this.archivePath(configuration.primaryRoot, archive);
+    let path = this.archivePath(configuration.primaryRoot, nativeStringBytes(archive));
     if (path.length > 784)
       throw new RangeError('Buriko archive locator path exceeds native scratch');
     let record = await this.archives.copyEntry(path, name);
     if (record === null) {
       if (!this.files.media.isAvailable(configuration.secondaryMediaPath)) return null;
-      path = this.archivePath(configuration.secondaryRoot, archive);
+      path = this.archivePath(configuration.secondaryRoot, nativeStringBytes(archive));
       if (path.length > 784)
         throw new RangeError('Buriko archive locator path exceeds native scratch');
       record = await this.archives.copyEntry(path, name);
@@ -528,25 +555,25 @@ export class BurikoProgramResources implements BurikoBpModuleResourceSource {
     if ((await this.relativePath(config.nativeFileRoot, pointer)) !== null) return 1;
     if (archive === null)
       return Number((await this.relativePath(config.secondaryMediaPath, pointer)) !== null);
-    const archiveBytes = typeof archive === 'function' ? archive() : archive;
+    archiveBytes(archive);
     const path = (root: Uint8Array): Uint8Array => {
-      const result = this.archivePath(root, archiveBytes);
+      const result = this.archivePath(root, archiveBytes(archive));
       if (result.length > 784)
         throw new RangeError('Buriko availability archive path exceeds native scratch');
       return result;
     };
-    const filename = textBytes(pointer);
+    const filename = scanText(pointer);
     if (await this.archives.contains(path(config.primaryRoot), filename)) return 1;
     return Number(
       files.media.isAvailable(config.secondaryMediaPath) &&
-        (await this.archives.contains(path(config.secondaryRoot), filename)),
+        (await this.archives.contains(path(config.secondaryRoot), scanText(pointer))),
     );
   }
 
   /** 1400bd6b0 really loads/decodes and frees the bytes; its fallback differs from bd7d0. */
   async size(
     archive: BurikoArchiveName | null,
-    name: Uint8Array,
+    name: BurikoNativeString,
     actor = this.mainProcessing.allocator.currentActor,
   ): Promise<number> {
     const primary = await this.loose(this.configuration.primaryRoot, name, undefined, actor);

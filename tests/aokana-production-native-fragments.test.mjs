@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {MountedFileSystem, StoredFileSystem} from '../dist/platform/filesystem.js';
 import {MemoryStore} from '../dist/platform/store.js';
-import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {BurikoBpMemory, hostPointer} from '../dist/engines/buriko/bp/memory.js';
 import {BurikoBpThread, pop32, push32} from '../dist/engines/buriko/bp/state.js';
 import {BurikoMemorySpeakerBackend} from '../dist/engines/buriko/native/audio/speaker-backend.js';
 import {BurikoMountedFileMetadata} from '../dist/engines/buriko/native/file-metadata.js';
@@ -231,6 +231,8 @@ test('partial production catalog routes BP calls through graph and mounted resou
   let titleEditorTarget = null;
   try {
     const memory = new BurikoBpMemory(new Uint8Array(0x1000));
+    const globalView = () =>
+      new DataView(memory.globalMemory.buffer, memory.globalMemory.byteOffset);
     const owners = new BurikoProductionDataOwners(graph, memory);
     const catalog = new BurikoProductionNativeFragments(graph, owners);
     const definitions = catalog.nativeDefinitions();
@@ -290,17 +292,10 @@ test('partial production catalog routes BP calls through graph and mounted resou
       ),
     );
     assert.equal(
-      graph.properties.create(
-        {bytes: memory.globalMemory, offset: 0x980},
-        null,
-        null,
-        null,
-        120,
-        180,
-      ),
+      graph.properties.create(hostPointer(memory.globalMemory, 0x980), null, null, null, 120, 180),
       0,
     );
-    titleEditorId = new DataView(memory.globalMemory.buffer).getUint32(0x980, true);
+    titleEditorId = globalView().getUint32(0x980, true);
     titlePanel = parent.children.at(-1);
     assert.equal(parent.children.length, beforePanels + 1);
     assert.equal(titlePanel.children[0].textContent, '蒼空');
@@ -332,9 +327,7 @@ test('partial production catalog routes BP calls through graph and mounted resou
       [...new TextEncoder().encode('Buriko Adapter\0'), 0xa5],
     );
     assert.deepEqual(
-      [0, 4, 8, 12].map((offset) =>
-        new DataView(memory.globalMemory.buffer).getUint32(0xd40 + offset, true),
-      ),
+      [0, 4, 8, 12].map((offset) => globalView().getUint32(0xd40 + offset, true)),
       [0x7788, 0x5566, 0x3344, 0x1122],
     );
     assert.deepEqual([...memory.globalMemory.subarray(0xd80, 0xd90)], Array(16).fill(0xa5));
@@ -383,15 +376,15 @@ test('partial production catalog routes BP calls through graph and mounted resou
     frameMilliseconds = 1;
     graph.frames.metrics.end(1);
     await invoke(0x80, 0x07, [0xa00, 0]);
-    assert.equal(new DataView(memory.globalMemory.buffer).getUint32(0xa00, true), 1);
+    assert.equal(globalView().getUint32(0xa00, true), 1);
     await invoke(0x80, 0x07, [0xa00, 1]);
-    assert.equal(new DataView(memory.globalMemory.buffer).getUint32(0xa00, true), 1000);
+    assert.equal(globalView().getUint32(0xa00, true), 1000);
     await invoke(0x80, 0x06, [0]);
     await invoke(0x80, 0x07, [0xa00, 0]);
-    assert.equal(new DataView(memory.globalMemory.buffer).getUint32(0xa00, true), 1);
+    assert.equal(globalView().getUint32(0xa00, true), 1);
     await invoke(0x80, 0x06, [1]);
     await invoke(0x80, 0x07, [0xa00, 0]);
-    assert.equal(new DataView(memory.globalMemory.buffer).getUint32(0xa00, true), 0);
+    assert.equal(globalView().getUint32(0xa00, true), 0);
     graph.manager.setRenderPixelBudget(4321);
     assert.equal(await invoke(0x80, 0x0b, [], true), 4321);
     assert.equal(await invoke(0x80, 0x09, [], true), graph.display.lastPresentMilliseconds);
@@ -415,7 +408,7 @@ test('partial production catalog routes BP calls through graph and mounted resou
     assert.equal(graph.receiver.messages, graph.messages);
     assert.equal(graph.resource.errors.files, graph.resource.files);
     assert.equal(graph.resource.errors.dialogs, graph.dialogs);
-    const toggleKeys = new DataView(memory.globalMemory.buffer);
+    const toggleKeys = globalView();
     toggleKeys.setUint32(0xb00, 0x77, true);
     toggleKeys.setUint32(0xb04, 0x79, true);
     toggleKeys.setUint32(0xb08, 0, true);
@@ -700,13 +693,13 @@ test('partial production catalog routes BP calls through graph and mounted resou
     memory.globalMemory.set(encode('Sprite'), 0xb00);
     await invoke(0x80, 0xe8, [0xb40]);
     assert.equal(
-      graph.text.decodeAuto({bytes: memory.globalMemory, offset: 0xb40}),
+      graph.text.decodeAuto(hostPointer(memory.globalMemory, 0xb40)),
       'AoNoKanataNoFourRhythmUEDL',
     );
     memory.globalMemory.set(encode('aokana.path'), 0xb80);
     assert.equal(await invoke(0x80, 0xf8, [0xc00, 0xb00, 0xb40], true), 1);
     assert.equal(
-      graph.text.decodeAuto({bytes: memory.globalMemory, offset: 0xc00}),
+      graph.text.decodeAuto(hostPointer(memory.globalMemory, 0xc00)),
       'C:\\game\\Installed',
     );
     assert.equal(graph.registry.openHandleCount, 0);
@@ -731,19 +724,19 @@ test('partial production catalog routes BP calls through graph and mounted resou
     );
     await invoke(0x80, 0xfb, [0xc40]);
     assert.equal(
-      graph.text.decodeAuto({bytes: memory.globalMemory, offset: 0xc40}),
+      graph.text.decodeAuto(hostPointer(memory.globalMemory, 0xc40)),
       'C:\\game\\Windows',
     );
     assert.equal(await invoke(0x80, 0xfa, [0xc80, 0xb80], true), 1);
     assert.equal(
-      graph.text.decodeAuto({bytes: memory.globalMemory, offset: 0xc80}),
+      graph.text.decodeAuto(hostPointer(memory.globalMemory, 0xc80)),
       'C:\\game\\Installed',
     );
     graph.folders.combine(
-      {bytes: memory.globalMemory, offset: 0xe00},
-      {bytes: memory.globalMemory, offset: 0xc80},
+      hostPointer(memory.globalMemory, 0xe00),
+      hostPointer(memory.globalMemory, 0xc80),
       1,
-      {bytes: encode('content.txt'), offset: 0},
+      hostPointer(encode('content.txt')),
     );
     const installedContent = await graph.resource.files.open(memory.globalMemory.subarray(0xe00));
     assert.ok(installedContent.source);
@@ -777,7 +770,7 @@ test('partial production catalog routes BP calls through graph and mounted resou
     );
     thread.moduleMemory.set(encode('Virtual.arc'), 0x150);
     thread.moduleMemory.set(encode('Raw.bin'), 0x170);
-    const pointers = new DataView(thread.moduleMemory.buffer);
+    const pointers = new DataView(thread.moduleMemory.buffer, thread.moduleMemory.byteOffset);
     pointers.setUint32(0x190, 0x10000170, true);
     pointers.setUint32(0x194, 0, true);
     assert.equal(await invoke(0x80, 0x38, [0x10000150, 0x10000190], true), 1);
@@ -796,18 +789,18 @@ test('partial production catalog routes BP calls through graph and mounted resou
     assert.equal(graph.resource.worker.scripts, graph.resource.scripts);
     memory.globalMemory.set(encode('C:\\game\\Script.bin'), 0x300);
     assert.equal(await invoke(0x81, 0x28, [0x220, 0x300, 0], true), 0);
-    const scriptId = new DataView(memory.globalMemory.buffer).getUint32(0x220, true);
+    const scriptId = globalView().getUint32(0x220, true);
     assert.equal(scriptId, 1);
     assert.equal(await invoke(0x81, 0x2b, [0x224, scriptId, 1], true), 0);
     assert.equal(await graph.resource.worker.processOne(), 'script');
-    assert.equal(new DataView(memory.globalMemory.buffer).getUint32(0x224, true), 1);
+    assert.equal(globalView().getUint32(0x224, true), 1);
     assert.equal(await invoke(0x81, 0x2a, [0x224, scriptId, 0x240, 2], true), 0);
     assert.equal(await graph.resource.worker.processOne(), 'script');
     assert.deepEqual([...memory.globalMemory.subarray(0x240, 0x242)], [5, 7]);
-    assert.equal(new DataView(memory.globalMemory.buffer).getUint32(0x224, true), 2);
+    assert.equal(globalView().getUint32(0x224, true), 2);
     assert.equal(await invoke(0x81, 0x29, [0x224, scriptId], true), 0);
     assert.equal(await graph.resource.worker.processOne(), 'script');
-    assert.equal(new DataView(memory.globalMemory.buffer).getUint32(0x224, true), 1);
+    assert.equal(globalView().getUint32(0x224, true), 1);
     assert.equal(graph.resource.scripts.find(scriptId), null);
 
     assert.equal(graph.localized.text, graph.text);
@@ -816,14 +809,17 @@ test('partial production catalog routes BP calls through graph and mounted resou
     memory.globalMemory.set(new TextEncoder().encode('abc\0'), 0x300);
     assert.equal(await invoke(0x81, 0x27, [0x300], true), 0x80000000);
     assert.equal(await invoke(0x81, 0x20, [0x340, 0x300, 2], true), 3);
-    assert.deepEqual([...new Uint16Array(memory.globalMemory.buffer, 0x340, 4)], [97, 98, 99, 0]);
+    assert.deepEqual(
+      [...new Uint16Array(memory.globalMemory.buffer, memory.globalMemory.byteOffset + 0x340, 4)],
+      [97, 98, 99, 0],
+    );
     graph.localized.load(new TextEncoder().encode('KEY=base\n@languageid=411\nKEY=Japanese\n'));
-    const key = {bytes: new TextEncoder().encode('KEY\0'), offset: 0};
+    const key = hostPointer(new TextEncoder().encode('KEY\0'));
     const readLocalized = () => {
       const result = graph.localized.lookup(key);
       assert.ok(result);
-      const end = result.bytes.indexOf(0, result.offset);
-      return new TextDecoder().decode(result.bytes.subarray(result.offset, end));
+      const end = result.view().indexOf(0, result.offset);
+      return new TextDecoder().decode(result.view().subarray(result.offset, end));
     };
     assert.equal(readLocalized(), 'base');
     assert.equal(await invoke(0x81, 0x02, [0x411], true), 0x411);

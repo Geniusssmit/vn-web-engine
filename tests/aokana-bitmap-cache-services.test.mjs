@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {StoredFileSystem} from '../dist/platform/filesystem.js';
 import {MemoryStore} from '../dist/platform/store.js';
-import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {BurikoBpMemory, hostPointer} from '../dist/engines/buriko/bp/memory.js';
 import {BurikoBpThread, pop32, push32} from '../dist/engines/buriko/bp/state.js';
 import {
   BurikoProgramFiles,
@@ -34,6 +34,8 @@ import {BurikoBitmapCacheServices} from '../dist/engines/buriko/native/bitmap-ca
 import {createGroup90BitmapCacheServices} from '../dist/engines/buriko/native/group-90-bitmap-cache-services.js';
 import {BurikoRawSurfaceExport} from '../dist/engines/buriko/native/raw-surface-export.js';
 import {BURIKO_NATIVE_SLOT_ADDRESSES} from '../dist/engines/buriko/native/inventory.js';
+// VM banks share one arena buffer; always build views with their byteOffset/byteLength.
+const bankView = (bytes) => new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 
 test('90:C0/C1/C6/C7 allocate headers and consume shared resource/preload caches into real surfaces', async () => {
   const fs = new StoredFileSystem(new MemoryStore()),
@@ -86,7 +88,7 @@ test('90:C0/C1/C6/C7 allocate headers and consume shared resource/preload caches
     slots = createGroup90BitmapCacheServices(
       new BurikoBitmapCacheServices(bitmapLoading, registration),
     ),
-    pointer = (offset) => ({bytes: memory.globalMemory, offset}),
+    pointer = (offset) => hostPointer(memory.globalMemory, offset),
     packed = Uint8Array.from([
       2, 0, 1, 0, 32, 0, 0, 0, 0, 0, 1, 0, 7, 0, 9, 0, 51, 34, 17, 255, 102, 85, 68, 255,
     ]),
@@ -179,7 +181,7 @@ test('90:C0/C1/C6/C7 allocate headers and consume shared resource/preload caches
       Array.from(memory.globalMemory.subarray(512, 520)),
       [51, 34, 17, 255, 102, 85, 68, 255],
     );
-    assert.equal(new DataView(memory.globalMemory.buffer).getUint32(480, true), 8);
+    assert.equal(bankView(memory.globalMemory).getUint32(480, true), 8);
   } finally {
     processing.dispose();
   }

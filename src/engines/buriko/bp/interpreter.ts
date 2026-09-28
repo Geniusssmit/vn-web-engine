@@ -14,6 +14,8 @@ import {controlOpcodes} from './opcodes/control.js';
 import {integerOpcodes} from './opcodes/integer.js';
 import {memoryOpcodes} from './opcodes/memory.js';
 import {localOpcodes} from './opcodes/locals.js';
+import {fixedOpcodes} from './opcodes/fixed.js';
+import {nativeMathOpcodes} from './opcodes/native-math.js';
 
 // Scalar/stack operations, watched scalar stores, local-descriptor forms and control
 // flow whose operands (fixed-width or varint immediates) bound their work. A watched
@@ -22,11 +24,11 @@ import {localOpcodes} from './opcodes/locals.js';
 // a native definition opts in. Identity checks below exclude replacement handlers.
 const batchableHandlers: Readonly<Record<number, BurikoBpOpcodeHandler>> = Object.fromEntries(
   [
-    0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0a, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
-    0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23,
-    0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33,
-    0x34, 0x35, 0x36, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3e, 0x3f, 0x40, 0x42, 0x56, 0x73, 0xe2, 0xe3,
-    0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xee, 0xef,
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0a, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
+    0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22,
+    0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32,
+    0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3e, 0x3f, 0x40, 0x42, 0x56, 0x73,
+    0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xee, 0xef,
   ].map((opcode) => [
     opcode,
     (controlOpcodes[opcode] ??
@@ -35,6 +37,16 @@ const batchableHandlers: Readonly<Record<number, BurikoBpOpcodeHandler>> = Objec
       localOpcodes[opcode])!,
   ]),
 );
+
+/** The pure primary handlers an accelerated core may execute in their place. */
+const directHandlers: Readonly<Record<number, BurikoBpOpcodeHandler>> = {
+  ...controlOpcodes,
+  ...integerOpcodes,
+  ...memoryOpcodes,
+  ...localOpcodes,
+  ...fixedOpcodes,
+  ...nativeMathOpcodes,
+};
 
 export type BurikoBpDispatchResult =
   | {readonly defined: false; readonly opcode: number}
@@ -49,6 +61,8 @@ export class BurikoBpInterpreter {
   private readonly primary: readonly (BurikoBpOpcodeHandler | undefined)[];
   /** Scheduling hint only; the selected handlers and instruction results stay native. */
   readonly batchableOpcodes: readonly boolean[];
+  /** Opcodes whose selected handler is the canonical pure handler, never a replacement. */
+  readonly directOpcodes: readonly boolean[];
   private validatedContext: BurikoBpOpcodeContext | null = null;
   /** Per native primary, the secondaries whose bank definitions opted into batching. */
   readonly batchableNativeSlots: readonly (readonly boolean[] | undefined)[];
@@ -93,6 +107,13 @@ export class BurikoBpInterpreter {
     this.batchableNativeSlots = Object.freeze(
       Array.from({length: 256}, (_, opcode) =>
         nativeSlots[opcode] !== undefined ? nativeBank.batchableSecondaries(opcode) : undefined,
+      ),
+    );
+    this.directOpcodes = Object.freeze(
+      Array.from(
+        {length: 256},
+        (_, opcode) =>
+          handlers[opcode] !== undefined && handlers[opcode] === directHandlers[opcode],
       ),
     );
     this.batchableOpcodes = Object.freeze(

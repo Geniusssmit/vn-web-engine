@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {BurikoBpMemory, hostPointer} from '../dist/engines/buriko/bp/memory.js';
 import {BurikoBpThread, pop32, push32} from '../dist/engines/buriko/bp/state.js';
 import {BurikoNativeText} from '../dist/engines/buriko/native/text.js';
 import {BurikoNativeFonts} from '../dist/engines/buriko/native/fonts.js';
@@ -83,17 +83,22 @@ test('91 annotation collection and registered text measurement share drawing own
   assert.equal(await call(0x95, output, source), 0);
   assert.equal(pop32(thread), 2);
   assert.equal(
-    text.decodeAuto({bytes: memory.globalMemory, offset: output}),
+    text.decodeAuto(hostPointer(memory.globalMemory, output)),
     'AB\\reading\nAB\\reading\n',
   );
   assert.equal(state.annotations.first.used, 0);
 
   const measured = 1024,
     phrase = put('AB'),
-    view = new DataView(memory.globalMemory.buffer);
+    view = () =>
+      new DataView(
+        memory.globalMemory.buffer,
+        memory.globalMemory.byteOffset,
+        memory.globalMemory.byteLength,
+      );
   assert.equal(await call(0x9b, measured, phrase, registered, 8, 100, 0, 0), 0);
   assert.equal(pop32(thread), 0);
-  assert.equal(view.getInt32(measured, true), 8);
+  assert.equal(view().getInt32(measured, true), 8);
   assert.equal(await call(0x99, 2), 0);
   assert.equal(pop32(thread), 1);
   assert.equal(state.proportionalSideBearing, 32768);
@@ -101,12 +106,12 @@ test('91 annotation collection and registered text measurement share drawing own
   assert.equal(pop32(thread), 0);
   // The filled raster spans all16 scratch columns. Cell8 gives margin4, left/right2:
   // two glyphs total2*(16+2+2), then native third metric excludes final right2.
-  assert.equal(view.getInt32(measured, true), 38);
+  assert.equal(view().getInt32(measured, true), 38);
   assert.equal(await call(0x99, 0), 0);
   assert.equal(pop32(thread), 1);
   assert.equal(await call(0x9b, measured, phrase, registered, 8, 100, 0, 1), 0);
   assert.equal(pop32(thread), 0);
-  assert.equal(view.getInt32(measured, true), 8);
+  assert.equal(view().getInt32(measured, true), 8);
   assert.equal(created, 1);
   assert.equal(thread.stackIndex, 0);
 });

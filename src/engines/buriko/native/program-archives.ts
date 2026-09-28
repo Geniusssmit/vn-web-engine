@@ -1,4 +1,4 @@
-import type {BurikoBpPointer} from '../bp/memory.js';
+import {hostPointer, type BurikoBpPointer} from '../bp/memory.js';
 import {FileError} from '../../../platform/filesystem.js';
 import {signature} from '../../../formats/buriko/binary.js';
 import {BurikoProgramFiles, terminatedNativeBytes} from './program-files.js';
@@ -7,7 +7,13 @@ import {
   decodeBurikoResource,
   type BurikoResourceDestination,
 } from './resource-decode.js';
-import {textBytes, textLength, writeText} from './text.js';
+import {
+  nativeStringBytes,
+  textBytes,
+  textLength,
+  writeText,
+  type BurikoNativeString,
+} from './text.js';
 import type {BurikoEngineErrors} from './engine-errors.js';
 import type {BurikoDistributedProcessing} from './distributed-processing.js';
 
@@ -69,13 +75,10 @@ export class BurikoProgramArchives {
   }
 
   private normalize(bytes: Uint8Array, capacity: number | null = 784): Uint8Array {
-    const result = this.files.text.convertEncoding(
-      {bytes: terminatedNativeBytes(bytes), offset: 0},
-      1,
-    );
+    const result = this.files.text.convertEncoding(hostPointer(terminatedNativeBytes(bytes)), 1);
     if (capacity !== null && result.length > capacity)
       throw new RangeError('Buriko archive path exceeds native scratch storage');
-    this.files.text.lowercase({bytes: result, offset: 0});
+    this.files.text.lowercase(hostPointer(result));
     return result;
   }
 
@@ -104,14 +107,11 @@ export class BurikoProgramArchives {
     const records = new DataView(target.index.buffer);
     for (let index = 0; index < target.count; index++) {
       const offset = index * 128;
-      const destination = {bytes: target.index, offset};
+      const destination = hostPointer(target.index, offset);
       if (packed) {
         // Each destination record is cleared immediately before converting that record.
         target.index.fill(0, offset, offset + 128);
-        writeText(
-          destination,
-          this.files.text.convertEncoding({bytes: stored, offset: index * 32}, 1),
-        );
+        writeText(destination, this.files.text.convertEncoding(hostPointer(stored, index * 32), 1));
         this.files.text.lowercase(destination);
         records.setUint32(offset + 96, source.getUint32(index * 32 + 16, true), true);
         records.setUint32(offset + 100, source.getUint32(index * 32 + 20, true), true);
@@ -120,7 +120,7 @@ export class BurikoProgramArchives {
           const original = textBytes(destination, true).slice();
           if (original.length > 96)
             throw new RangeError('Buriko ARC20 name overflows native conversion scratch');
-          writeText(destination, this.files.text.convertEncoding({bytes: original, offset: 0}, 1));
+          writeText(destination, this.files.text.convertEncoding(hostPointer(original), 1));
         }
         this.files.text.lowercase(destination);
       }
@@ -289,11 +289,11 @@ export class BurikoProgramArchives {
     return next === null ? 0x80000010 : this.releaseFrom(next, path);
   }
 
-  private find(archive: OrdinaryArchive, name: Uint8Array): number | null {
-    const query = this.normalize(name);
+  private find(archive: OrdinaryArchive, name: BurikoNativeString): number | null {
+    const query = this.normalize(nativeStringBytes(name));
     for (let index = 0; index < archive.count; index++) {
       const offset = index * 128;
-      if (equal(textBytes({bytes: archive.index, offset}, true), query)) return offset;
+      if (equal(textBytes(hostPointer(archive.index, offset), true), query)) return offset;
     }
     return null;
   }
@@ -310,15 +310,19 @@ export class BurikoProgramArchives {
       );
     const names: Uint8Array[] = [];
     for (let index = 0; index < archive.count; index++)
-      names.push(textBytes({bytes: archive.index, offset: index * 128}, true).slice());
+      names.push(textBytes(hostPointer(archive.index, index * 128), true).slice());
     return names;
   }
 
-  async size(path: Uint8Array, name: Uint8Array): Promise<number> {
+  async size(path: Uint8Array, name: BurikoNativeString): Promise<number> {
     return this.sizeFrom(this.root, path, name);
   }
 
-  private async sizeFrom(root: ArchiveNode, path: Uint8Array, name: Uint8Array): Promise<number> {
+  private async sizeFrom(
+    root: ArchiveNode,
+    path: Uint8Array,
+    name: BurikoNativeString,
+  ): Promise<number> {
     const matched = await this.archive(path, root);
     if (matched === null) return 0x80000010;
     const archive = matched.archive;
@@ -344,7 +348,7 @@ export class BurikoProgramArchives {
   private async entry(
     root: ArchiveNode,
     path: Uint8Array,
-    name: Uint8Array,
+    name: BurikoNativeString,
   ): Promise<{
     archive: OrdinaryArchive;
     record: number;
@@ -368,11 +372,11 @@ export class BurikoProgramArchives {
   }
 
   /** BB350 tests record identity directly, so a present zero-byte entry remains available. */
-  async contains(path: Uint8Array, name: Uint8Array): Promise<boolean> {
-    if (textLength({bytes: terminatedNativeBytes(name), offset: 0}) >= 96) {
+  async contains(path: Uint8Array, name: BurikoNativeString): Promise<boolean> {
+    if (textLength(hostPointer(terminatedNativeBytes(nativeStringBytes(name)))) >= 96) {
       return this.errors.fatal(
         this.files.text.encodeWide(
-          `指定されたファイル名 [ ${this.files.path(name)} ] は95文字を超えています`,
+          `指定されたファイル名 [ ${this.files.path(nativeStringBytes(name))} ] は95文字を超えています`,
           1,
         ),
       );
@@ -381,7 +385,7 @@ export class BurikoProgramArchives {
   }
 
   /** Native metadata query 038a00 returns the first matching entry's untouched qword at +104. */
-  async metadata(path: Uint8Array, name: Uint8Array): Promise<bigint | null> {
+  async metadata(path: Uint8Array, name: BurikoNativeString): Promise<bigint | null> {
     const found = await this.entry(this.root, path, name);
     return found === null
       ? null
@@ -389,13 +393,13 @@ export class BurikoProgramArchives {
   }
 
   /** 0398A0/+18 copies the actual first matching 128-byte entry, without decoding its payload. */
-  async copyEntry(path: Uint8Array, name: Uint8Array): Promise<Uint8Array | null> {
+  async copyEntry(path: Uint8Array, name: BurikoNativeString): Promise<Uint8Array | null> {
     const found = await this.entry(this.root, path, name);
     return found === null ? null : found.archive.index.slice(found.record, found.record + 128);
   }
 
   /** 039780/+28 repeats member selection and returns the physical component's path. */
-  async entryPath(path: Uint8Array, name: Uint8Array): Promise<Uint8Array | null> {
+  async entryPath(path: Uint8Array, name: BurikoNativeString): Promise<Uint8Array | null> {
     const matched = await this.archive(path);
     if (matched === null) return null;
     const archive = matched.archive;
@@ -430,7 +434,7 @@ export class BurikoProgramArchives {
 
   async read(
     path: Uint8Array,
-    name: Uint8Array,
+    name: BurikoNativeString,
     offset = 0,
     length = 0,
   ): Promise<BurikoArchiveResource> {
@@ -440,7 +444,7 @@ export class BurikoProgramArchives {
   private async readFrom(
     root: ArchiveNode,
     path: Uint8Array,
-    name: Uint8Array,
+    name: BurikoNativeString,
     offset: number,
     length: number,
   ): Promise<BurikoArchiveResource> {
@@ -493,16 +497,16 @@ export class BurikoProgramArchives {
   /** 1400bbee0 maps cache/read/decode statuses; callers receive the native high-bit result. */
   async resource(
     path: Uint8Array,
-    name: Uint8Array,
+    name: BurikoNativeString,
     offset = 0,
     length = 0,
     destination?: BurikoResourceDestination | null,
     actor = this.mainProcessing.allocator.currentActor,
   ): Promise<BurikoArchiveResource> {
-    if (textLength({bytes: terminatedNativeBytes(name), offset: 0}) > 95) {
+    if (textLength(hostPointer(terminatedNativeBytes(nativeStringBytes(name)))) > 95) {
       return this.errors.fatal(
         this.files.text.encodeWide(
-          `指定されたファイル名 [ ${this.files.path(name)} ] は95文字を超えています`,
+          `指定されたファイル名 [ ${this.files.path(nativeStringBytes(name))} ] は95文字を超えています`,
           1,
         ),
       );
@@ -533,7 +537,9 @@ export class BurikoProgramArchives {
     ];
     return {
       result: decoded.status === 0 ? decoded.bytes!.length : mapped,
-      bytes: decoded.bytes,
+      get bytes() {
+        return decoded.bytes;
+      },
       initialized: decoded.initialized,
     };
   }

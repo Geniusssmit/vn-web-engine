@@ -6,7 +6,7 @@ import {BurikoFontResources} from '../dist/engines/buriko/native/font-resources.
 import {BurikoBrowserFonts} from '../dist/engines/buriko/native/font-browser.js';
 import {createGroupB0Fonts} from '../dist/engines/buriko/native/group-b0-fonts.js';
 import {BurikoBpThread, pop32, push32} from '../dist/engines/buriko/bp/state.js';
-import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {BurikoBpMemory, hostPointer} from '../dist/engines/buriko/bp/memory.js';
 import {BURIKO_NATIVE_SLOT_ADDRESSES} from '../dist/engines/buriko/native/inventory.js';
 import {
   BurikoFontRaster,
@@ -20,9 +20,11 @@ import {
   burikoCrtWideLower,
   burikoCrtWidePrefixEqual,
 } from '../dist/engines/buriko/native/crt-case.js';
+// VM banks share one arena buffer; always build views with their byteOffset/byteLength.
+const bankView = (bytes) => new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 
 const bytes = (value) => new TextEncoder().encode(value + '\0');
-const pointer = (value) => ({bytes: bytes(value), offset: 0});
+const pointer = (value) => hostPointer(bytes(value), 0);
 const mainProcessing = () => ({
   allocator: {
     currentActor: 0,
@@ -112,19 +114,19 @@ test('font B0 bindings preserve NULL enumeration queries, outputs and cached arc
     return pop32(thread);
   };
   const source = (offset, value) => memory.globalMemory.set(bytes(value), offset);
-  const view = new DataView(memory.globalMemory.buffer);
+  const view = () => bankView(memory.globalMemory);
   assert.equal(await run(0xc4, [0]), 20);
   assert.equal(await run(0xc4, [128]), 2);
-  assert.equal(text.decodeAuto({bytes: memory.globalMemory, offset: 128}), 'MS Gothic');
-  assert.equal(text.decodeAuto({bytes: memory.globalMemory, offset: 138}), 'MS Mincho');
+  assert.equal(text.decodeAuto(hostPointer(memory.globalMemory, 128)), 'MS Gothic');
+  assert.equal(text.decodeAuto(hostPointer(memory.globalMemory, 138)), 'MS Mincho');
   assert.equal(await run(0xc5, [0, 384]), 0);
   source(1, 'Missing');
-  view.setUint32(64, 0xdeadbeef, true);
+  view().setUint32(64, 0xdeadbeef, true);
   assert.equal(await run(0xc6, [64, 1]), 0);
-  assert.equal(view.getUint32(64, true), 0xdeadbeef);
+  assert.equal(view().getUint32(64, true), 0xdeadbeef);
   source(1, 'Found');
   assert.equal(await run(0xc6, [64, 1]), 1);
-  assert.equal(view.getUint32(64, true), 2);
+  assert.equal(view().getUint32(64, true), 2);
   source(1, 'cache.ttf');
   assert.equal(await run(0xc2, [1]), 1);
   // Address 0x10000 resolves but cannot be read. A cache hit must never scan it.
@@ -232,7 +234,7 @@ test('enumeration uses prefix matching and appends raw defaults only for exact c
   const resources = new BurikoFontResources(fonts, {});
   const result = await resources.enumerate(128, false);
   assert.deepEqual(
-    result.names.map((value) => text.decodeAuto({bytes: value, offset: 0})),
+    result.names.map((value) => text.decodeAuto(hostPointer(value, 0))),
     ['ms gothic Extra', 'MS Mincho'],
   );
   assert.equal(
@@ -245,7 +247,7 @@ test('enumeration uses prefix matching and appends raw defaults only for exact c
   const japanese = await resources.enumerate(128, true);
   assert.equal(japanese.names[0][0], 0x82);
   assert.deepEqual(
-    japanese.names.map((value) => text.decodeAuto({bytes: value, offset: 0})),
+    japanese.names.map((value) => text.decodeAuto(hostPointer(value, 0))),
     ['ＭＳ ゴシック', 'ＭＳ 明朝'],
   );
 });
@@ -316,9 +318,9 @@ test('list selection omits empty lines, retains CR, and leaves cancellation outp
     },
   };
   const selection = new BurikoSelectionDialog(dialogs, text);
-  const output = {bytes: new Uint8Array(30).fill(0xa5), offset: 2};
+  const output = hostPointer(new Uint8Array(30).fill(0xa5), 2);
   assert.equal(await selection.select(output, null, null, pointer('\nFirst\r\n\nSecond\n')), 0);
-  assert.equal(output.bytes[2], 0xa5);
+  assert.equal(output.view()[2], 0xa5);
   assert.deepEqual(requests[0].faces, ['First\r', 'Second']);
   accepted = true;
   assert.equal(
@@ -326,7 +328,7 @@ test('list selection omits empty lines, retains CR, and leaves cancellation outp
     1,
   );
   assert.equal(text.decodeAuto(output), 'Second');
-  assert.equal(output.bytes[1], 0xa5);
+  assert.equal(output.view()[1], 0xa5);
   accepted = false;
   assert.equal(await selection.select(null, null, null, pointer('')), 0);
 });

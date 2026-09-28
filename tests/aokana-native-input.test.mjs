@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {BurikoBpThread, pop32, push32} from '../dist/engines/buriko/bp/state.js';
-import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {BurikoBpMemory, hostPointer} from '../dist/engines/buriko/bp/memory.js';
 import {BurikoNativeClock} from '../dist/engines/buriko/native/clock.js';
 import {BurikoNativeDisplayState} from '../dist/engines/buriko/native/display-state.js';
 import {BurikoNativeInput} from '../dist/engines/buriko/native/input.js';
@@ -240,7 +240,10 @@ test('native input slot pop order, capture flushing and click-index validation',
   input.recordClickPosition(2, 40, 50);
   call(0x81, 0x07, 0x10, 2);
   assert.equal(pop32(thread), 1);
-  assert.deepEqual([...new Int32Array(bytes.buffer, 16, 2)], [40, 50]);
+  assert.deepEqual(
+    [...new Int32Array(memory.globalMemory.buffer, memory.globalMemory.byteOffset + 16, 2)],
+    [40, 50],
+  );
   call(0x80, 0x10, 0);
   assert.equal(input.enabled, 0);
   assert.equal(input.totalPresses(13), 2);
@@ -288,7 +291,7 @@ test('native touch receiver retains two-pass order, metadata and distance-filter
   ]);
   assert.equal(input.totalPresses(7), 1);
   const output = new Uint8Array(128),
-    pointer = {bytes: output, offset: 0};
+    pointer = hostPointer(output);
   assert.equal(touch.copyContacts(pointer), 2);
   assert.deepEqual(
     [...new Uint32Array(output.buffer, 0, 12)],
@@ -298,7 +301,7 @@ test('native touch receiver retains two-pass order, metadata and distance-filter
   assert.equal(touch.copyHistory(null, null, 0, 1), 0);
   touch.receive([sample(1, 10, 0)]);
   touch.receive([sample(1, 20, 0)]);
-  const angles = {bytes: output, offset: 80};
+  const angles = hostPointer(output, 80);
   assert.equal(touch.copyHistory(pointer, angles, 0, 9), 2);
   assert.deepEqual([...new Int32Array(output.buffer, 0, 4)], [10, 0, 0, 0]);
   assert.deepEqual([...new Uint32Array(output.buffer, 80, 2)], [0, 0xffffffff]);

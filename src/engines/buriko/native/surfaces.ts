@@ -1,3 +1,4 @@
+import {viewsOverlap} from '../../../core/binary.js';
 import {BurikoSurfaceToneCurves} from './surface-tone-curves.js';
 import {applyBurikoBitmapTone} from './bitmap-tone.js';
 import {recolorBurikoBitmapAlpha, replaceBurikoBitmapColor} from './bitmap-recolor.js';
@@ -88,7 +89,7 @@ function importInitializedRgb24(
     !Number.isSafeInteger(source.stride) ||
     !(input.bytes.buffer instanceof ArrayBuffer) ||
     !(output.bytes.buffer instanceof ArrayBuffer) ||
-    input.bytes.buffer === output.bytes.buffer ||
+    viewsOverlap(input.bytes, output.bytes) ||
     (initialized !== undefined &&
       (!(initialized.buffer instanceof ArrayBuffer) || initialized.length !== input.bytes.length))
   )
@@ -405,16 +406,17 @@ export class BurikoSurfaces {
     if (x < 0 || x >= bitmap.width || y < 0 || y >= bitmap.height) return 3;
     if (output === null) throw new Error('Buriko surface pixel query dereferences a null output');
     pointerView(output, 4).setUint32(0, 0, true);
-    const backing = bitmap.storage;
-    if (backing !== null && backing.bytes.buffer === output.bytes.buffer) {
-      const start = output.bytes.byteOffset + output.offset - backing.bytes.byteOffset;
+    const backing = bitmap.storage,
+      outputBytes = output.view();
+    if (backing !== null && backing.bytes.buffer === outputBytes.buffer) {
+      const start = outputBytes.byteOffset + output.offset - backing.bytes.byteOffset;
       const first = Math.max(0, start),
         last = Math.min(backing.bytes.length, start + 4);
       if (first < last) backing.written(first, last - first);
     }
     const offset = bitmap.offset + Math.imul(bitmap.stride, y) + (Math.imul(count, x) >>> 0);
     const storage = bitmapStorage(bitmap, offset, count, true);
-    output.bytes.set(storage.bytes.subarray(offset, offset + count), output.offset);
+    outputBytes.set(storage.bytes.subarray(offset, offset + count), output.offset);
     return 0;
   }
   /** 140040500 returns the actual mutable descriptor inside a live slot. */
@@ -494,7 +496,7 @@ export class BurikoSurfaces {
     const size = Math.imul(stride, height) >>> 0;
     let owner: BurikoBitmapStorage;
     try {
-      owner = new BurikoBitmapStorage(new Uint8Array(size), false);
+      owner = BurikoBitmapStorage.allocate(size, false);
     } catch (error) {
       if (error instanceof RangeError) return 0;
       throw error;
@@ -593,7 +595,7 @@ export class BurikoSurfaces {
     let stride = Math.imul(bytesPerPixel, width);
     if (alignedRows !== 0) stride = (stride + 3) & ~3;
     const source: BurikoBitmap = {
-      storage: BurikoBitmapStorage.tracked(data.bytes, initialized),
+      storage: BurikoBitmapStorage.tracked(data.view(), initialized),
       offset: data.offset,
       stride,
       width: width | 0,

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {StoredFileSystem, MountedFileSystem} from '../dist/platform/filesystem.js';
 import {MemoryStore} from '../dist/platform/store.js';
-import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {BurikoBpMemory, hostPointer} from '../dist/engines/buriko/bp/memory.js';
 import {BurikoBpThread, pop32, push32} from '../dist/engines/buriko/bp/state.js';
 import {BurikoMountedFileMetadata} from '../dist/engines/buriko/native/file-metadata.js';
 import {
@@ -87,8 +87,8 @@ test('80:2f copies real files with independent readonly clearing, persistent ove
     }),
     slot = createGroup80Copy(files)[0];
   const copy = async (source, destination) => {
-    bytes.set(text.encodeWide(source, 1), 32);
-    bytes.set(text.encodeWide(destination, 1), 256);
+    memory.globalMemory.set(text.encodeWide(source, 1), 32);
+    memory.globalMemory.set(text.encodeWide(destination, 1), 256);
     push32(thread, 256);
     push32(thread, 32);
     assert.equal(await slot.execute({thread, memory}), 0);
@@ -115,7 +115,8 @@ test('80:2f copies real files with independent readonly clearing, persistent ove
   const enumeration = new BurikoFileEnumeration(files);
   bytes.set(text.encodeWide('C:\\EXISTI~1.TXT', 1), 32);
   assert.equal(
-    (await enumeration.enumerate({bytes, offset: 1024}, 1024, {bytes, offset: 32}, false, 0)).count,
+    (await enumeration.enumerate(hostPointer(bytes, 1024), 1024, hostPointer(bytes, 32), false, 0))
+      .count,
     1,
   );
   assert.equal(

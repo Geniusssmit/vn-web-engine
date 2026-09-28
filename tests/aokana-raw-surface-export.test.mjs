@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {BurikoBpMemory, hostPointer} from '../dist/engines/buriko/bp/memory.js';
 import {BurikoBpThread, push32} from '../dist/engines/buriko/bp/state.js';
 import {BurikoBitmapCompositor} from '../dist/engines/buriko/native/bitmap-compositor.js';
 import {bitmapRead32, bitmapWrite32} from '../dist/engines/buriko/native/bitmap-scalar.js';
@@ -35,7 +35,14 @@ test('90:15 exports packed BGR pixels into BP memory for a real raw surface impo
   [64, 32, 64, 0].forEach((value) => push32(thread, value));
   assert.equal(slot.execute({thread, memory, diagnostics: {}}), 0);
   assert.equal(thread.stackIndex, 0);
-  assert.equal(new DataView(memory.globalMemory.buffer).getUint32(32, true), 12);
+  assert.equal(
+    new DataView(
+      memory.globalMemory.buffer,
+      memory.globalMemory.byteOffset,
+      memory.globalMemory.byteLength,
+    ).getUint32(32, true),
+    12,
+  );
   assert.deepEqual(
     Array.from(memory.globalMemory.subarray(64, 76)),
     [0x33, 0x22, 0x11, 0x66, 0x55, 0x44, 0x99, 0x88, 0x77, 0xcc, 0xbb, 0xaa],
@@ -44,7 +51,7 @@ test('90:15 exports packed BGR pixels into BP memory for a real raw surface impo
     original.map((_, i) => bitmapRead32(source, source.offset + i * 4)),
     original,
   );
-  assert.equal(surfaces.importRaw(1, 2, 2, 1, {bytes: memory.globalMemory, offset: 64}), 1);
+  assert.equal(surfaces.importRaw(1, 2, 2, 1, hostPointer(memory.globalMemory, 64)), 1);
   const imported = surfaces.snapshot(1);
   assert.deepEqual(
     original.map((_, i) => bitmapRead32(imported, imported.offset + i * 4)),

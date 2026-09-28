@@ -14,8 +14,22 @@ import {
   releaseThreadRegions,
 } from '../dist/engines/buriko/bp/state.js';
 import * as decode from '../dist/engines/buriko/bp/decode.js';
-import {BurikoBpMemory, BurikoBpHeap, pointerView} from '../dist/engines/buriko/bp/memory.js';
+import {
+  BurikoBpMemory,
+  BurikoBpHeap,
+  BurikoBpRegion,
+  BurikoBpRegionTable,
+  pointerView,
+  hostPointer,
+} from '../dist/engines/buriko/bp/memory.js';
 import {attachModule, detachLastModule} from '../dist/engines/buriko/bp/modules.js';
+import {
+  copyMemoryBytes,
+  clearIndeterminateMemory,
+  hasIndeterminateMemory,
+  markIndeterminateMemory,
+  requireDeterminateMemory,
+} from '../dist/core/indeterminate-memory.js';
 
 const thread = (options = {}) =>
   new BurikoBpThread({
@@ -106,7 +120,7 @@ test('Buriko signed and typed varints retain x64 shift behavior, including overl
       assert.equal(t.pc, length);
     }
   }
-  t.moduleMemory = Uint8Array.of(0x80);
+  t.moduleRegion = new BurikoBpRegion(Uint8Array.of(0x80));
   t.pc = 0;
   assert.throws(() => decode.readVarInt(t));
   assert.equal(t.pc, 0);
@@ -122,7 +136,7 @@ test('Buriko byte readers retain offset conversion and faults across resized or 
     [decode.readTypedVarInt, {type: 3, value: -16}],
   ]) {
     const t = thread();
-    t.moduleMemory = Uint8Array.of(0x43, 1);
+    t.moduleRegion = new BurikoBpRegion(Uint8Array.of(0x43, 1));
     for (const [pc, next] of [
       [0, 1],
       [0.75, 1],
@@ -140,7 +154,7 @@ test('Buriko byte readers retain offset conversion and faults across resized or 
       assert.equal(t.pc, reader === decode.fetchOpcode ? (pc + 1) >>> 0 : pc);
     }
     const buffer = new ArrayBuffer(4, {maxByteLength: 8});
-    t.moduleMemory = new Uint8Array(buffer, 1, 2);
+    t.moduleRegion = new BurikoBpRegion(new Uint8Array(buffer, 1, 2));
     t.moduleMemory[0] = 0x43;
     t.pc = 0;
     assert.deepEqual(reader(t), expected);
@@ -163,7 +177,7 @@ test('Buriko byte readers retain offset conversion and faults across resized or 
       new SharedArrayBuffer(1, {maxByteLength: 2}),
     ]) {
       const t = thread();
-      t.moduleMemory = new Uint8Array(buffer);
+      t.moduleRegion = new BurikoBpRegion(new Uint8Array(buffer));
       t.moduleMemory[0] = 0x80;
       const pc = {
         valueOf() {
@@ -219,7 +233,7 @@ test('Buriko tagged memory preserves byte overlap in global/module/frame/heap ba
     t.moduleMemory.subarray(1, 9),
     Uint8Array.of(0x10, 0x10, 0x20, 0x34, 0x12, 0x50, 0x60, 0x70),
   );
-  assert.throws(() => pointerView({bytes: new Uint8Array(8).subarray(0, 2), offset: 1}, 2));
+  assert.throws(() => pointerView(hostPointer(new Uint8Array(8).subarray(0, 2), 1), 2));
 });
 
 test('Buriko pooled addresses select every bank and forbid freeing interior addresses', () => {
@@ -241,7 +255,7 @@ test('Buriko pooled addresses select every bank and forbid freeing interior addr
   ];
   for (const [bank, group, slot] of cases) {
     const bytes = Uint8Array.of(bank, 0x33, 0x44);
-    m.pools[group][slot] = {bytes, offset: 0};
+    m.pools[group][slot] = new BurikoBpRegion(bytes);
     const address = (bank * 0x10000000) >>> 0;
     assert.equal(m.readU8(t, address), bank);
     assert.equal(m.readU16(t, address + 1), 0x4433);
@@ -258,14 +272,14 @@ test('Buriko pooled addresses select every bank and forbid freeing interior addr
 });
 
 test('Buriko heap first-fit, growth, free coalescing, and address reuse preserve contents', () => {
-  const heap = new BurikoBpHeap();
+  const heap = new BurikoBpHeap(new BurikoBpRegionTable());
   assert.equal(heap.allocate(7), 0);
   assert.equal(heap.allocate(9), 7);
   assert.equal(heap.allocate(0x8000 - 16), 16);
-  heap.bytes.set([11, 22, 33], 7);
+  heap.region.view().set([11, 22, 33], 7);
   assert.equal(heap.allocate(1), 0x8000);
-  assert.equal(heap.bytes.length, 0x10000);
-  assert.deepEqual(heap.bytes.subarray(7, 10), Uint8Array.of(11, 22, 33));
+  assert.equal(heap.region.view().length, 0x10000);
+  assert.deepEqual(heap.region.view().subarray(7, 10), Uint8Array.of(11, 22, 33));
   assert.equal(heap.free(7), true);
   assert.equal(heap.free(0), true);
   assert.equal(heap.free(7), false);
@@ -283,15 +297,15 @@ test('Buriko indirect buffers retain handle identity across resize and insertion
   const {result, address} = m.createBuffer(4);
   assert.equal(result, 0);
   assert.equal(address, 0x0fff001f);
-  assert.equal(m.writeBuffer(address, 0, {bytes: Uint8Array.of(1, 2, 3, 4), offset: 0}, 4), 0);
-  assert.equal(m.resolve(t, address + 0x700).bytes, m.resolve(t, address).bytes);
+  assert.equal(m.writeBuffer(address, 0, hostPointer(Uint8Array.of(1, 2, 3, 4), 0), 4), 0);
+  assert.equal(m.resolve(t, address + 0x700).view(), m.resolve(t, address).view());
   assert.equal(m.resizeBuffer(address, 6), 0);
-  assert.deepEqual(m.resolve(t, address).bytes.subarray(0, 4), Uint8Array.of(1, 2, 3, 4));
-  assert.equal(m.insertBuffer(address, 2, {bytes: Uint8Array.of(8, 9), offset: 0}, 2), 0);
-  assert.deepEqual(m.resolve(t, address).bytes.subarray(0, 6), Uint8Array.of(1, 2, 8, 9, 3, 4));
+  assert.deepEqual(m.resolve(t, address).view().subarray(0, 4), Uint8Array.of(1, 2, 3, 4));
+  assert.equal(m.insertBuffer(address, 2, hostPointer(Uint8Array.of(8, 9), 0), 2), 0);
+  assert.deepEqual(m.resolve(t, address).view().subarray(0, 6), Uint8Array.of(1, 2, 8, 9, 3, 4));
   assert.equal(m.bufferSize(address).size, 8);
-  assert.equal(m.readBuffer(address, 8, {bytes: new Uint8Array(), offset: 0}, 0), 0x80000010);
-  assert.equal(m.readBuffer(address, 7, {bytes: new Uint8Array(2), offset: 0}, 2), 0x80000008);
+  assert.equal(m.readBuffer(address, 8, hostPointer(new Uint8Array(), 0), 0), 0x80000010);
+  assert.equal(m.readBuffer(address, 7, hostPointer(new Uint8Array(2), 0), 2), 0x80000008);
   assert.equal(m.freeIndirect(address, 1), 0x80000009);
   assert.equal(m.freeIndirect(address, 0), 0);
   assert.equal(m.resolve(t, address), null);
@@ -377,6 +391,99 @@ test('Buriko child threads share bases, forward allocation and validation, and r
   assert.equal(owner.moduleMemory[80], 7);
   child.disposeStorage();
   assert.equal(owner.retentionCount, 0);
-  assert.equal(owner.heap.bytes.length, 0x8000);
+  assert.equal(owner.heap.region.view().length, 0x8000);
   assert.equal(owner.moduleMemory[80], 7);
+});
+
+test('Buriko arena growth keeps addresses, provenance and stale-pointer contents', () => {
+  const m = new BurikoBpMemory(new Uint8Array(0x100), undefined, 0x1000);
+  const t = new BurikoBpThread({
+    id: 1,
+    operandCapacity: 4,
+    moduleCapacity: 0x20,
+    frameCapacity: 0x20,
+    heapEnabled: false,
+    regions: m.regions,
+  });
+  m.writeU32(t, 0x20000004, 0x11223344);
+  push32(t, 0x55);
+  markIndeterminateMemory(t.frameMemory, 8, 2, 'unwritten frame');
+  const earlyView = m.globalMemory;
+  const generation = m.memoryViews().generation;
+  const pooled = m.allocatePooled(0x3000);
+  assert.ok(m.memoryViews().generation > generation);
+  assert.equal(earlyView.length, 0);
+  assert.equal(m.readU32(t, 0x20000004), 0x11223344);
+  assert.equal(pop32(t), 0x55);
+  assert.throws(() => m.readU8(t, 0x20000009), /unwritten frame/);
+  const {bytes} = m.memoryViews();
+  assert.equal(bytes[t.frameRegion.arenaOffset + 4], 0x44);
+
+  const region = m.resolve(t, pooled).region;
+  m.writeU8(t, pooled + 3, 9);
+  const stale = m.resolve(t, pooled);
+  assert.equal(m.freePooled(pooled), true);
+  assert.equal(region.retired, true);
+  assert.equal(region.arenaOffset, -1);
+  assert.equal(stale.view()[3], 9);
+  assert.equal(m.allocatePooled(0x3000), pooled);
+  assert.equal(m.readU8(t, pooled + 3), 0);
+  assert.equal(stale.view()[3], 9);
+});
+
+test('arena provenance bitmap reports the same faults as host-buffer provenance', () => {
+  let state = 7;
+  const random = (limit) => {
+    state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+    return (state >>> 8) % limit;
+  };
+  const table = new BurikoBpRegionTable(0x100);
+  const arena = [table.allocate(64), table.allocate(64)].map((region) => () => region.view());
+  const host = [new Uint8Array(64), new Uint8Array(64)].map((bytes) => () => bytes);
+  const outcome = (action) => {
+    try {
+      return String(action());
+    } catch (error) {
+      return error.message;
+    }
+  };
+  for (let step = 0; step < 4000; step++) {
+    const kind = random(6),
+      which = random(2),
+      offset = random(60),
+      length = 1 + random(12),
+      reason = `reason ${random(4)}`,
+      target = random(52);
+    const results = [arena, host].map((banks) => {
+      const bytes = banks[which]();
+      const other = banks[which ^ 1]();
+      switch (kind) {
+        case 0:
+          return outcome(() =>
+            markIndeterminateMemory(bytes, offset, Math.min(length, 64 - offset), reason),
+          );
+        case 1:
+          return outcome(() =>
+            clearIndeterminateMemory(bytes, offset, Math.min(length, 64 - offset)),
+          );
+        case 2:
+          return outcome(() =>
+            copyMemoryBytes(other, target, bytes, offset, Math.min(length, 12, 64 - offset)),
+          );
+        case 3:
+          return outcome(() =>
+            copyMemoryBytes(bytes, target, bytes, offset, Math.min(length, 12, 64 - offset)),
+          );
+        case 4:
+          return outcome(() =>
+            hasIndeterminateMemory(bytes, offset, Math.min(length, 64 - offset)),
+          );
+        default:
+          return outcome(() =>
+            requireDeterminateMemory(bytes, offset, Math.min(length, 64 - offset)),
+          );
+      }
+    });
+    assert.equal(results[0], results[1], `step ${step}`);
+  }
 });

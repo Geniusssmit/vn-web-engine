@@ -8,14 +8,14 @@ import {BurikoLogicalSpatialQueries} from '../dist/engines/buriko/native/logical
 import {createGroupD0SpatialQueries} from '../dist/engines/buriko/native/group-d0-spatial-queries.js';
 import {createGroupD0SpatialRecords} from '../dist/engines/buriko/native/group-d0-spatial.js';
 import {BurikoBpThread, pop32, push32} from '../dist/engines/buriko/bp/state.js';
-import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {BurikoBpMemory, hostPointer} from '../dist/engines/buriko/bp/memory.js';
 
 function fixture() {
   const manager = new BurikoLogicalSpatialManager(),
     queries = new BurikoLogicalSpatialQueries(manager),
     bytes = new Uint8Array(2048),
     view = new DataView(bytes.buffer);
-  const pointer = (offset) => ({bytes, offset});
+  const pointer = (offset) => hostPointer(bytes, offset);
   const words = (offset, count) =>
     Array.from({length: count}, (_, i) => view.getInt32(offset + i * 4, true));
   const create = (
@@ -50,9 +50,9 @@ test('relative queries validate source then target and preserve native zero/over
   create(2, [-32768, -32768, -32768]);
   assert.equal(queries.relativeToPosition(pointer(100), 2, 32768, 32768, 32768), 0);
   assert.deepEqual(words(100, 5), [-1, 37837, 37837, 37837, -2147483648]);
-  const short = {bytes: new Uint8Array(4), offset: 0};
+  const short = hostPointer(new Uint8Array(4), 0);
   assert.throws(() => queries.relativeToRecord(short, 0, 1), /access|range|bounds/i);
-  assert.equal(new DataView(short.bytes.buffer).getUint32(0, true), 1);
+  assert.equal(new DataView(short.view().buffer).getUint32(0, true), 1);
   assert.equal(view.getInt32(100, true), -1);
 });
 
@@ -119,7 +119,7 @@ test('record overlap uses the derived offset and third property, retaining stale
 });
 
 test('query wrappers consume all arguments in native order and retain lifetime references on output faults', () => {
-  const {bytes, view, words} = fixture(),
+  const {bytes} = fixture(),
     managers = new BurikoLogicalSpatialManagers();
   const thread = new BurikoBpThread({
     id: 1,
@@ -127,7 +127,13 @@ test('query wrappers consume all arguments in native order and retain lifetime r
     moduleCapacity: 64,
     frameCapacity: 64,
   });
-  const h = {thread, memory: new BurikoBpMemory(bytes)};
+  const h = {thread, memory: new BurikoBpMemory(bytes)},
+    view = () => {
+      const bank = h.memory.globalMemory;
+      return new DataView(bank.buffer, bank.byteOffset, bank.byteLength);
+    },
+    words = (offset, count) =>
+      Array.from({length: count}, (_, i) => view().getInt32(offset + i * 4, true));
   const definitions = [
     ...createGroupD0SpatialRecords(managers),
     ...createGroupD0SpatialQueries(managers),
@@ -138,7 +144,7 @@ test('query wrappers consume all arguments in native order and retain lifetime r
     return pop32(thread);
   };
   assert.equal(call(0x40, 16), 0);
-  const id = view.getUint32(16, true);
+  const id = view().getUint32(16, true);
   for (const [index, point] of [
     [0, [10, 20, 30]],
     [1, [13, 24, 30]],
@@ -153,11 +159,11 @@ test('query wrappers consume all arguments in native order and retain lifetime r
   assert.equal(call(0x7a, 100, id, 0, ...[13, 24, 30].map((n) => n * 65536)), 0);
   assert.deepEqual(words(100, 5), [-1, 39322, 52429, 0, 327680]);
   assert.equal(call(0x78, 100, 4, id, 0, 1), 0);
-  assert.equal(view.getUint32(4, true), 1);
+  assert.equal(view().getUint32(4, true), 1);
   assert.equal(call(0x74, 100, 4, id, 0, 1), 0);
-  assert.deepEqual(words(100, view.getUint32(4, true)), [1]);
+  assert.deepEqual(words(100, view().getUint32(4, true)), [1]);
   assert.equal(call(0x75, 100, 4, id, ...[13, 24, 30, 1].map((n) => n * 65536), -1, 1), 0);
-  assert.deepEqual(words(100, view.getUint32(4, true)), [1]);
+  assert.deepEqual(words(100, view().getUint32(4, true)), [1]);
   assert.equal(call(0x79, 0, id, 63, 63), 0x12);
   assert.equal(call(0x79, 0, id, 0, 63), 0x13);
   assert.equal(call(0x79, 0, id + 1, 0, 1), 1);

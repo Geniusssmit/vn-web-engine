@@ -29,6 +29,13 @@ import {BurikoAudioStaticResources} from '../dist/engines/buriko/native/audio/re
 import {BurikoAudioLoaderQueues} from '../dist/engines/buriko/native/audio/loader-queues.js';
 import {BurikoScriptFiles} from '../dist/engines/buriko/native/script-files.js';
 import {BurikoSharedLoaderWorker} from '../dist/engines/buriko/native/shared-loader-worker.js';
+import {hostPointer} from '../dist/engines/buriko/bp/memory.js';
+
+// A pointer view sits at an arbitrary offset in the shared VM arena.
+const viewOf = (p) => {
+  const bytes = p.view();
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+};
 
 test('per-program script close leaves one mounted loader alive until final stop', async () => {
   const backing = new StoredFileSystem(new MemoryStore(), (path) => path.toLowerCase());
@@ -102,12 +109,12 @@ test('per-program script close leaves one mounted loader alive until final stop'
     caller = {};
   try {
     worker.start({automatic: false});
-    const handle = {bytes: new Uint8Array(4), offset: 0};
+    const handle = hostPointer(new Uint8Array(4));
     assert.equal(
-      await scripts.open(handle, {bytes: encode('C:\\game\\document'), offset: 0}, 0, caller),
+      await scripts.open(handle, hostPointer(encode('C:\\game\\document')), 0, caller),
       0,
     );
-    const id = new DataView(handle.bytes.buffer).getUint32(0, true);
+    const id = viewOf(handle).getUint32(0, true);
     await worker.closeProgramScripts(caller);
     assert.equal(scripts.find(id), null);
     assert.equal(scripts.hasLiveSection, false);

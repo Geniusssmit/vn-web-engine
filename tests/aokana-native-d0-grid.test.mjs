@@ -9,15 +9,15 @@ import {BurikoLogicalGridVisibility} from '../dist/engines/buriko/native/logical
 import {BurikoNativeSpline} from '../dist/engines/buriko/native/spline.js';
 import {createGroupD0Grid} from '../dist/engines/buriko/native/group-d0-grid.js';
 import {BurikoBpThread, pop32, push32} from '../dist/engines/buriko/bp/state.js';
-import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {BurikoBpMemory, hostPointer} from '../dist/engines/buriko/bp/memory.js';
 
 function fixture(width = 3, height = 3) {
   const manager = new BurikoLogicalGridManager(1),
     bytes = new Uint8Array(4096),
     view = new DataView(bytes.buffer),
-    pointer = (offset) => ({bytes, offset}),
+    pointer = (offset) => hostPointer(bytes, offset),
     cells = new Uint8Array(width * height * 16);
-  manager.setCells(width, height, {bytes: cells, offset: 0});
+  manager.setCells(width, height, hostPointer(cells, 0));
   const create = (x, y) => {
     manager.createAgent(pointer(16));
     const id = view.getUint32(16, true);
@@ -180,7 +180,7 @@ test('grid visibility uses spline terrain samples, source flags, threshold bound
     source = new DataView(cells.buffer);
   source.setInt32(0, 2, true);
   source.setInt32(48, 3, true);
-  corners.setCells(2, 2, {bytes: cells, offset: 0});
+  corners.setCells(2, 2, hostPointer(cells, 0));
   assert.deepEqual(
     [...new Int32Array(corners.corners.buffer)],
     [0, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0, 0],
@@ -188,7 +188,7 @@ test('grid visibility uses spline terrain samples, source flags, threshold bound
 });
 
 test('all nineteen D0 grid wrappers consume the verified native arguments and map statuses', () => {
-  const {bytes, view} = fixture(),
+  const {bytes} = fixture(),
     managers = new BurikoLogicalGridManagers(),
     definitions = createGroupD0Grid(managers),
     thread = new BurikoBpThread({
@@ -198,6 +198,7 @@ test('all nineteen D0 grid wrappers consume the verified native arguments and ma
       frameCapacity: 32,
     }),
     h = {thread, memory: new BurikoBpMemory(bytes)},
+    view = () => new DataView(h.memory.globalMemory.buffer, h.memory.globalMemory.byteOffset),
     call = (secondary, ...args) => {
       for (const arg of args) push32(thread, arg);
       assert.equal(definitions.find((entry) => entry.secondary === secondary).execute(h), 0);
@@ -207,12 +208,12 @@ test('all nineteen D0 grid wrappers consume the verified native arguments and ma
     };
   assert.equal(definitions.length, 19);
   assert.equal(call(0, 16, 0, 1), 1);
-  const id = view.getUint32(16, true);
+  const id = view().getUint32(16, true);
   assert.equal(call(4, id, 3, 3, 1024), 0);
   assert.equal(call(5, 20, id, 1280), 0);
-  const plane = view.getUint32(20, true);
+  const plane = view().getUint32(20, true);
   assert.equal(call(0x10, 24, id), 0);
-  const agent = view.getUint32(24, true);
+  const agent = view().getUint32(24, true);
   assert.equal(call(0x14, id, agent, 1, 1), 0);
   assert.equal(call(0x15, id, agent, 4, 160), 0);
   assert.equal(call(0x16, id, agent, 128), 0);
@@ -220,16 +221,16 @@ test('all nineteen D0 grid wrappers consume the verified native arguments and ma
   assert.equal(call(0x18, id, agent, 2), 0);
   assert.equal(call(0x20, id, agent, 1, 2, -1, -1), 0);
   assert.equal(call(0x21, 256, 28, id, agent, 0, 0), 0);
-  assert.equal(view.getInt32(28, true), 2);
+  assert.equal(view().getInt32(28, true), 2);
   assert.equal(call(0x22, 512, id, agent), 0);
   assert.equal(call(0x23, 256, 28, id, agent), 0);
-  assert.equal(view.getInt32(28, true), 8);
+  assert.equal(view().getInt32(28, true), 8);
   assert.equal(call(0x28, 256, 768, 28, id, 1, 1, 3, 0, 0, 0, 1), 0);
-  assert.equal(view.getInt32(28, true), 8);
+  assert.equal(view().getInt32(28, true), 8);
   assert.equal(call(0x2c, 32, 1, 0, id, agent), 0);
-  assert.equal(view.getInt32(32, true), 0);
+  assert.equal(view().getInt32(32, true), 0);
   assert.equal(call(0x2d, 32, id, 1, 0, 1, 1), 0);
-  assert.equal(view.getInt32(32, true), 2);
+  assert.equal(view().getInt32(32, true), 2);
   assert.equal(call(0x12, id, agent), 0);
   assert.equal(call(0x11, id, agent), 0);
   assert.equal(call(1, id), 1);

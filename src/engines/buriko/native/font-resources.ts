@@ -3,6 +3,8 @@ import {BurikoProgramResources} from './program-resources.js';
 import {terminatedNativeBytes} from './program-files.js';
 import {burikoCrtWideLower, burikoCrtWidePrefixEqual} from './crt-case.js';
 import {FileError} from '../../../platform/filesystem.js';
+import {hostPointer} from '../bp/memory.js';
+import {nativeStringBytes, type BurikoNativeString} from './text.js';
 
 const englishDefaults = [
   new TextEncoder().encode('MS Gothic'),
@@ -31,8 +33,8 @@ export class BurikoFontResources {
 
   /** 1400bdee0: cache identity is the lowercased wide filename, independently of archive. */
   async load(
-    archive: Uint8Array | null | (() => Uint8Array),
-    filename: Uint8Array,
+    archive: BurikoNativeString | null,
+    filename: BurikoNativeString,
     actor = this.resources.mainProcessing.allocator.currentActor,
   ): Promise<number> {
     const operationAllocator = this.resources.mainProcessing.allocator,
@@ -41,7 +43,7 @@ export class BurikoFontResources {
       operationAllocator.withActor(operationActor, operation);
 
     const key = burikoCrtWideLower(
-      this.fonts.text.decodeAuto({bytes: terminatedNativeBytes(filename), offset: 0}),
+      this.fonts.text.decodeAuto(hostPointer(terminatedNativeBytes(nativeStringBytes(filename)))),
     );
     if (this.loaded.has(key)) return 0;
     let bytes: Uint8Array;
@@ -58,13 +60,11 @@ export class BurikoFontResources {
       }
     } else {
       // The resource-name pointer is not scanned at all for an already loaded filename.
-      const archiveName = typeof archive === 'function' ? archive() : archive;
-      const size = await runAsActor(() =>
-        this.resources.size(archiveName, filename, operationActor),
-      );
+      nativeStringBytes(archive);
+      const size = await runAsActor(() => this.resources.size(archive, filename, operationActor));
       if (size === 0) return 0x80000019;
       const loaded = await runAsActor(() =>
-        this.resources.load(archiveName, filename, true, undefined, operationActor),
+        this.resources.load(archive, filename, true, undefined, operationActor),
       );
       if (loaded.result !== size) return 0x8000001b;
       if (loaded.bytes === null)
@@ -100,7 +100,7 @@ export class BurikoFontResources {
     charset |= 0;
     const defaults = japanese ? japaneseDefaults : englishDefaults;
     const wideDefaults = defaults.map((name) =>
-      this.fonts.text.decodeAuto({bytes: terminatedNativeBytes(name), offset: 0}),
+      this.fonts.text.decodeAuto(hostPointer(terminatedNativeBytes(name))),
     );
     const seen = [false, false];
     const names: Uint8Array[] = [];

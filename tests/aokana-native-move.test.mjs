@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {StoredFileSystem, MountedFileSystem} from '../dist/platform/filesystem.js';
 import {MemoryStore} from '../dist/platform/store.js';
-import {BurikoBpMemory} from '../dist/engines/buriko/bp/memory.js';
+import {BurikoBpMemory, hostPointer} from '../dist/engines/buriko/bp/memory.js';
 import {BurikoBpThread, pop32, push32} from '../dist/engines/buriko/bp/state.js';
 import {BurikoMountedFileMetadata} from '../dist/engines/buriko/native/file-metadata.js';
 import {
@@ -76,8 +76,8 @@ test('80:27 moves real shared directory trees and copies files between independe
     }),
     slot = createGroup80Move(files)[0];
   const move = async (source, destination) => {
-    bytes.set(text.encodeWide(source, 1), 32);
-    bytes.set(text.encodeWide(destination, 1), 256);
+    memory.globalMemory.set(text.encodeWide(source, 1), 32);
+    memory.globalMemory.set(text.encodeWide(destination, 1), 256);
     push32(thread, 256);
     push32(thread, 32);
     assert.equal(await slot.execute({thread, memory}), 0);
@@ -103,7 +103,7 @@ test('80:27 moves real shared directory trees and copies files between independe
   const enumeration = new BurikoFileEnumeration(files);
   bytes.set(text.encodeWide('C:\\Renamed\\*', 1), 32);
   assert.deepEqual(
-    await enumeration.enumerate({bytes, offset: 1024}, 1024, {bytes, offset: 32}, false, 0),
+    await enumeration.enumerate(hostPointer(bytes, 1024), 1024, hostPointer(bytes, 32), false, 0),
     {count: 1, size: new TextEncoder().encode('資料.txt\0').length},
   );
   assert.equal(new TextDecoder().decode(bytes.subarray(1024, bytes.indexOf(0, 1024))), '資料.txt');
