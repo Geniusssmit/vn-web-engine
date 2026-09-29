@@ -99,6 +99,8 @@ Read-only paths use accessors that do not count as writes: `readOnlyBytes()` set
 
 `node tools/benchmark-buriko-sprite-control.mjs --output /tmp/sprite-control.json` compares both profiles using generated pixel buffers and fixed-clock coordinate-spline updates. Setup, mipmap generation, and output hashing are outside the timed process polls. The probe checks complete mixed-pixel hashes and final control state without displaying images; its control-step durations are not game frame times.
 
+Browser optimized also rasterizes a horizontal text layout's new glyphs on workers before the layout runs; see "Glyph rasterization" below. The layout native call then crosses a host turn where Native completes it synchronously. Glyph bytes are identical.
+
 The shared installed-font catalog snapshots this profile before enumeration. Native reads one font at a time; Browser optimized admits up to four independent Blob/metadata jobs. Both return the browser's record order and each collection's face order, skip unreadable records, and retain only metadata. Profile changes affect the next catalog request. This policy changes read scheduling without changing font selection or cache lifetime.
 
 A generated background computation and ordered BP children can compare scheduling without game assets:
@@ -302,7 +304,38 @@ The Wasm run stage stores runs of up to 32 bytes with two 16-byte vector stores 
 - **Diagnostics.** `buriko.decode.dsc.worker` and `buriko.decode.cbg-legacy.worker` time the round trip. `.worker-applied` records 1 per worker result and 0 per fallback. `buriko.decode.cbg-legacy.publish` covers writes into caller storage.
 - **A/B switch.** `?decode-worker=0` keeps all decoding on the main thread.
 
-In a 6× throttled Aokana slot 3 capture, main-thread legacy decoding fell from 719 ms to zero. The eight decodes took 129 ms of worker round trips. Main-thread work that remains on the loading path is copying: the codec worker's all-initialized mask for direct images, the preload cache's validity scan and copy of each decoded image (`bitmap-preload-cache.ts`), and repeated 34 MB raw loose-file reads, each copied by `decodeBurikoResource`.
+In a 6× throttled Aokana slot 3 capture, main-thread legacy decoding fell from 719 ms to zero. The eight decodes took 129 ms of worker round trips.
+
+Three copies on the loading path are now skipped in both profiles. None of them changes VM-visible bytes or fault checks:
+
+- **No mask for private legacy output.** Private legacy CompressedBG output is written completely, so `decodeBurikoResource` no longer attaches an all-ones validity mask. An absent mask already means fully defined. This saves a fill of the image size, about 23 MB per Aokana sprite sheet, and every later zero-byte scan of it.
+- **Preload adoption.** `RegisterBitmapProcess` releases the decoder's private output right after preloading it. When no import ran first, the preload cache now adopts that buffer (`insertPointer(..., owned)`) instead of copying it. Masked sources are still validated before adoption. Slot 3's eight preload inserts fell from 183 ms to 0.3 ms (`buriko.bitmap.register-cache`).
+- **Owned raw reads.** Aokana's script loads `system.arc`, a 34 MB archive, whole as a loose resource, eight times in the slot 3 window. `looseFile` passes ownership of its fresh whole-file read (`readsFreshBytes`, true for blob-backed sources), so raw output returns that array instead of copying it.
+
+- **Size query cache.** Aokana's `scrmsg._bp` queries the decoded size of `C:\game\system.arc` (80:35 `ReadDecodedResourceSize`) before every message. It then reads 4 bytes of the file with 81:32 `ReadDriveFile` and ignores both results. Native 1400bd6b0 loads and decodes the whole resource to answer, so each message read 34 MB. `BurikoProgramResources` now remembers successful loose decoded sizes by opened `ByteSource`. Installed files reopen as the same immutable source. Written or shadowing files open as new sources and are measured again, and failed reads are not remembered. Loads still read the file. In slot 3, one of eight queries read the file, and bytes read in the window fell from 282 MB to 44 MB. `buriko.resource.size-cache-hit` records 1 per hit and 0 per miss.
+
+Importing a preloaded image into a bitmap still copies it, because the resource cache adopts the same bytes afterwards (`bitmap-loading.ts`). Native keeps both copies too.
+
+### Streamed Vorbis music
+
+Native BGI decodes Ogg Vorbis with `ov_read` in each 100 ms stream refill. The browser path used to decode a whole track before its stream opened, and the VM waits on that call. In Aokana slot 4, the first click changes the soundtrack. The new track is 3.95 MB of Ogg, 98 s at 44.1 kHz, and decoding it took about 211 ms. For that long, the game presented no frames and neither track played, in both runtime profiles.
+
+- **Streaming.** `createBurikoLiveOggWaveStream` now opens single-link tracks through `BurikoProgressiveOggDecoder` (`src/engines/buriko/native/audio/progressive-ogg.ts`). A reused worker (`src/audio/vorbis-stream-worker.ts`) decodes the track in chunks: first 5 s, which covers the stream's 4 s prefill, then 10 s at a time. libvorbis keeps its state between chunks, so their concatenation equals a single decode. With an EOS granule, planes are allocated to that bound. Each read and loop seek waits until the frames it needs are final, then runs the complete-PCM reader unchanged, so the produced bytes are identical.
+- **Error timing.** A decode error in a later packet now surfaces at the first read that needs those frames, as a native refill would see it, instead of when the stream opens.
+- **Complete decoding.** These keep it: chained links, tracks without a plausible EOS granule (reads wait for completion), static sounds, paired exchange streams, and the diagnostic `OfflineAudioContext` profile.
+- **Measurement.** The slot 4 freeze fell from about 265 ms to 50–58 ms at 1× in both profiles, measured as the longest gap between presents across the click. rAF gaps do not show it, because the main thread is idle while the VM waits.
+- **Other Vorbis decodes.** Complete decodes run on reused `WorkerPool` workers. Creating a worker, loading libvorbis and compiling it per decode made an 89 KB clip take 68 ms for 12 ms of decoding. It now takes 22–24 ms.
+
+### Glyph rasterization
+
+Buriko text uses the native NONANTIALIASED DIB path: `BurikoBrowserFontFace.rasterText` (`src/engines/buriko/native/font-browser.ts`) fills one glyph into a supersampled canvas, reads it back, and thresholds alpha at 128. `BurikoFontRaster` then box-filters that to coverage. At Aokana's text quality the DIB is 16× the glyph cell, about 530–670 × 780–1010 samples. Each uncached glyph therefore reads back about 2.7 MB of RGBA. In slot 3 no character was rasterized twice, so a cache across layouts would not help. Batching readbacks would not help either, because the cost scales with pixels, not calls.
+
+- **Both profiles.** `BurikoFontTextCanvas` (`font-canvas.ts`) keeps one configured context per DIB size. It clears in device space, because the face's horizontal scale can be below 1, and thresholds alpha as the sign of each 32-bit pixel. The old path created a canvas per glyph and resolved the CSS font on its first draw (`configure` and `scale` in profiles).
+- **Browser optimized.** Before `buildBurikoHorizontalTextLayout` starts, `BurikoFontRaster.prefetch` collects the text's characters that are missing from the native glyph cache. It does not touch the cache or its order. The face sends them to at most two workers (`font-raster-worker.ts`), which rasterize with the same `BurikoFontTextCanvas`. The layout awaits the results, then runs unchanged, and its synchronous `rasterText` calls consume the stored DIBs. Only reads happen before the await, and the layout re-reads its text and font state afterwards. Resource fonts reach a worker as their own bytes and descriptors, sent once per worker. Faces loaded with `local()` stay in-thread. One prefetch holds at most 64 DIBs. Characters beyond that, in fonts other than the base font, or evicted within one layout rasterize in-thread as before. A failed job disables the offload for the session.
+- **Diagnostics.** `buriko.text.raster.worker` times the round trip, and `.worker-applied` records 1 per successful prefetch and 0 per failure. `buriko.text.raster.prefetched` counts DIBs served from a prefetch.
+- **A/B switch.** `?text-worker=0` keeps glyph rasterization on the main thread.
+- **Measurements.** These are Aokana slot 3 captures at 6×, run under Browser optimized with `--frames --no-profile`. Before the change, main-thread gaps over 100 ms were 216, 208 and 124 ms, and `buriko.text.glyph.raster` totaled 816 ms. With the canvas reuse only (`?text-worker=0`), the gaps were 158 and 151 ms, and raster time was 566 ms. With workers, no gap exceeded 100 ms and raster time was 86 ms. All nine prefetches succeeded and served 78 of the 81 new glyphs. Worker round trips totaled 59 ms. Under Native, most slot 3 frames at 6× already take 100–135 ms. There the two glyph hitches fell from 217 and 208 ms to 150 and 149 ms, and raster time fell from 800 to 590 ms.
+- **Verification.** `node tools/probe-buriko-font-raster.mjs` compares both paths with a fresh-canvas reference, byte for byte. It uses a resource font loaded from bytes (`--font`, macOS Arial Unicode by default) and the generic fallback family, sizes 18–42, width percentages 50–140 and sample scales 1, 4 and 16. It also reports worker results that were not consumed.
 
 ## Local profiling build
 
