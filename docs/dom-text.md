@@ -24,8 +24,10 @@ clearing its client, hiding a presentation, or tearing down the runtime retires
 its DOM nodes. The no-canvas diagnostic mode never creates a DOM presentation.
 
 Browser glyph placement is approximate. Adjacent matching raster rows form one
-Text node with explicit native row boundaries. Its copy handler omits visual-wrap
-newlines from the source string. Completed rows do not reflow as a later row is
+Text node with explicit native row boundaries. Horizontal rows contain no newline
+characters: a floated `shape-outside` polygon ends each browser line at its native
+row's measured width, so selections and popup dictionaries read the source string
+across rows. Vertical rows use newline separators, which the copy handler omits. Completed rows do not reflow as a later row is
 revealed; horizontal scaling is anchored to the first row. Adapters with complete
 glyph buffers can use browser wrapping. Ruby and differently styled runs remain
 separate. Native row positions define line spacing; font size
@@ -40,11 +42,22 @@ Presentation owners can annotate a bitmap with `rasterTextFlow` to isolate contr
 text. Window overlays use independent flows; decoded wait-marker glyphs remain
 visible without entering dialogue width or line-spacing calculations. Flow
 identity follows copies, crops, clones, transforms and display uploads.
-Vertical text uses browser vertical layout. Shadows
-and outlines can be omitted; arbitrary blend, mask, mesh and displacement effects
-cannot be reproduced exactly by browser text. Fully occluded glyphs are excluded
-using native/textless pixel comparison, while partial occlusion and transformed
-glyph shapes remain best effort.
+Vertical text uses browser vertical layout.
+
+Glyph records carry the native CSS weight and a horizontal `stretch` (native glyph
+width relative to the font size). Slots with a stretch scale browser glyphs by it and
+set letter spacing so each advance equals the first row's native glyph pitch; slots
+without one only compress rows that are wider than native. Engines record effect
+passes as decorative ink and call `decorateRasterText` on the source glyph before
+compositing them, so the glyph carries its edge: offset shadows become SVG offset
+shadows. Outlines are painted beneath the ink: with engine `weights`, each edge
+pixel sums the browser glyph's weighted alpha over the radii and clamps at full
+coverage, as native edge rasterizers do; without them the glyph is dilated by the
+radii. In Buriko, `decorateBurikoBitmapText` maps text effect modes 1 (shadow) and
+2 (outline, with `burikoGlyphOutlineWeights`); effect alpha is `opacity / 256`. Arbitrary blend,
+mask, mesh and displacement effects cannot be reproduced exactly by browser text.
+Fully occluded glyphs are excluded using native/textless pixel comparison, while
+partial occlusion and transformed glyph shapes remain best effort.
 Custom bitmap glyphs retain their private-use character codes; browser fonts may
 show a fallback glyph when they do not contain those characters.
 Tracking retained text requires additional
