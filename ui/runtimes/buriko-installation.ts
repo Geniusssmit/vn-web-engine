@@ -14,6 +14,8 @@ import type {BurikoSavedGame} from '../player/buriko-library.js';
 export interface BurikoExecutable {
   /** Runtime mount entries retain their original range-readable source objects. */
   readonly runtimeFiles: readonly InstallationFile[];
+  /** A disc selection is the disc itself; the player also presents it as an optical drive. */
+  readonly installationKind: 'installed' | 'disc';
   /** Verified installed directories absent from file-only browser imports. */
   readonly installationDirectories: readonly string[];
   readonly executableName: string;
@@ -93,7 +95,7 @@ export async function inspectBurikoInstallation(
     const isInterpreter =
       versions.some(
         ({values}) =>
-          /BURIKO General Interpreter/i.test(values.FileDescription ?? '') ||
+          /^(?:Ethornell - )?BURIKO General Interpreter$/i.test(values.FileDescription ?? '') ||
           values.InternalName?.toLowerCase() === 'ethornell',
       ) || embeddedProductIdentity(bytes) !== null;
     if (isInterpreter) {
@@ -187,6 +189,7 @@ export async function inspectBurikoInstallation(
   const savedGame: BurikoSavedGame = legacy ?? {id, title, namespace: ['buriko', id, 'default']};
   return {
     runtimeFiles: runtime.files,
+    installationKind: runtime.kind,
     installationDirectories:
       digest === jewehaInstallationProfile.executableSha256
         ? jewehaInstallationProfile.emptyDirectories
