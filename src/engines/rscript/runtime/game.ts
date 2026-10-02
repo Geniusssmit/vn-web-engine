@@ -1,5 +1,13 @@
 import {parseGsc, type GscProgram} from '../../../formats/rscript/gsc.js';
 import type {RScriptApini} from '../apini.js';
+import type {RScriptMessages} from '../messages.js';
+import {
+  IDOK,
+  MB_ICONQUESTION,
+  MB_OK,
+  MB_OKCANCEL,
+  type WindowsMessageBoxHost,
+} from '../../../platform/windows-message-box.js';
 import {initializeConfig, initializeScene} from '../defaults.js';
 import type {RScriptFiles} from '../files.js';
 import {ADD_TABLE, createSurface, scaleRgb, type RScriptSurface} from '../graphics/pixels.js';
@@ -7,11 +15,19 @@ import {encodeWcg} from '../../../formats/rscript/wcg.js';
 import {RScriptContainer, RScriptSprite, type RScriptNode} from '../graphics/sprite.js';
 import {RScriptImages} from '../images.js';
 import {Config, GAME_VARIABLE_COUNT, Scene, RScriptMemory} from '../memory.js';
-import {decodeSlotSave, decodeSystemSave, encodeSlotSave, encodeSystemSave} from '../saves.js';
+import {
+  applySlotSave,
+  decodeSystemSave,
+  encodeSlotSave,
+  encodeSystemSave,
+  parseSlotSave,
+  type RScriptSlotState,
+} from '../saves.js';
 import {
   RScriptInterpreter,
   RScriptScriptEnd,
   type RScriptNativeHandler,
+  type RScriptScriptError,
 } from '../vm/interpreter.js';
 import {loadFrameAnimation} from './animation.js';
 import {AudioChannel, RScriptAudio} from './audio.js';
@@ -31,7 +47,7 @@ import {RScriptCharacters} from './characters.js';
 import type {PanelCommand} from './message-panel.js';
 import {createOpcodeHandlers} from './opcodes.js';
 import type {GlyphRasterizer} from './text-block.js';
-import {decodeCp932} from '../text.js';
+import {decodeCp932} from '../../../text/cp932.js';
 
 /** Installation-local persistent files such as `FRsave.dat` and `FRsave01.dat`. */
 export interface RScriptSaveStorage {
@@ -42,6 +58,7 @@ export interface RScriptSaveStorage {
 export interface RScriptGameHost {
   readonly files: RScriptFiles;
   readonly apini: RScriptApini;
+  readonly messages: RScriptMessages;
   readonly presenter: RScriptPresenter;
   readonly timer: RScriptTimer;
   readonly rasterizer: GlyphRasterizer;
@@ -51,11 +68,8 @@ export interface RScriptGameHost {
   playMovie(path: string): Promise<void>;
   /** Ends a movie started by `playMovie` early, when the scene restarts. */
   stopMovie(): void;
-  /**
-   * Asks the player to confirm (the MessageBox with OK and Cancel that titles without a
-   * custom dialog image use); resolves true for OK.
-   */
-  confirm(caption: string, text: string): Promise<boolean>;
+  /** MessageBoxA of the game window (the native confirmations call it through sub_452BE0). */
+  readonly messageBox: WindowsMessageBoxHost;
   /**
    * Font families the configuration's font window lists (0x4572F0): fixed-pitch TrueType
    * families with Shift-JIS support, by their Japanese names. Called from the font button's
@@ -138,17 +152,6 @@ class ScriptEvent {
 }
 
 const pad = (value: number, digits: number): string => String(value).padStart(digits, '0');
-
-/** Confirmation messages of the RScript 1.11 executable (0x481550..0x4821DC). */
-export const RScriptMessages = {
-  confirm: '確認',
-  returnToTitle: 'タイトル画面に戻ります。\r\nよろしいですか？',
-  overwrite: 'セーブデータを上書きします。\r\nよろしいですか？',
-  load: 'セーブデータをロードします。\r\nよろしいですか？',
-  quickLoad: 'クイックロードしますか？',
-  quitCaption: '終了確認',
-  quit: '本当にゲームを終了しますか？',
-} as const;
 
 /**
  * The RScript game scene (0x41E760 tick, 0x422FD0 script thread, 0x4292C0 rebuild): layers,
@@ -365,7 +368,21 @@ export class RScriptGame {
         }
       },
       diagnostic: (m) => this.diagnostic(m),
+      scriptError: (error) => this.scriptError(error),
     });
+  }
+
+  /** MessageBoxA(MB_OK) of a script error, with no caption except for a failed load. */
+  private async scriptError(error: RScriptScriptError): Promise<void> {
+    const {messages} = this.host;
+    if (error.kind === 'load') this.diagnostic(`Script ${error.script}: ${error.message}`);
+    const [text, caption] =
+      error.kind === 'nest-overflow'
+        ? [messages.nestOverflow, '']
+        : error.kind === 'nest-underflow'
+          ? [messages.nestUnderflow, '']
+          : [error.message, messages.compileErrorCaption];
+    await this.host.messageBox.messageBox(text, caption || 'エラー', MB_OK);
   }
 
   program(script: number): Promise<GscProgram> {
@@ -804,10 +821,20 @@ export class RScriptGame {
     else this.wheel(key === 'up');
   }
 
+  /**
+   * sub_452BE0: an OK/Cancel question box; true for OK. A title-supplied dialog replaces
+   * it natively when a callback is installed (+0x2A4); no supported title installs one.
+   */
+  private async confirm(caption: string, text: string): Promise<boolean> {
+    const type = MB_OKCANCEL | MB_ICONQUESTION;
+    return (await this.host.messageBox.messageBox(text, caption, type)) === IDOK;
+  }
+
   /** sub_41F200: loads slot 0 after a confirmation. */
   private async quickLoad(): Promise<void> {
     if (!(await this.readSlot(0))) return;
-    if (!(await this.host.confirm(RScriptMessages.confirm, RScriptMessages.quickLoad))) return;
+    const {confirm, quickLoad} = this.host.messages;
+    if (quickLoad === null || !(await this.confirm(confirm, quickLoad))) return;
     await this.loadSlot(0);
   }
 
@@ -1044,7 +1071,17 @@ export class RScriptGame {
   async loadSlot(slot: number): Promise<boolean> {
     const bytes = await this.readSlot(slot);
     if (!bytes) return false;
-    await this.restartScene(() => decodeSlotSave(this.memory, bytes));
+    let state: RScriptSlotState;
+    try {
+      state = parseSlotSave(this.memory.revision, bytes);
+    } catch (error) {
+      // A rejected slot leaves the running scene untouched.
+      this.diagnostic(
+        `Ignoring unreadable ${this.slotName(slot)}: ${error instanceof Error ? error.message : error}`,
+      );
+      return false;
+    }
+    await this.restartScene(() => applySlotSave(this.memory, state));
     return true;
   }
   /** sub_421740 + sub_4535F0: returns to the snapshot before the previous choice. */
@@ -1163,7 +1200,7 @@ export class RScriptGame {
     this.playSystemSound(1);
     if (command === 'save' || command === 'load') return this.openSaveScreen(command === 'save');
     if (command === 'close' || this.screens.standalone) return this.closeScreen();
-    if (await this.host.confirm(RScriptMessages.confirm, RScriptMessages.returnToTitle))
+    if (await this.confirm(this.host.messages.confirm, this.host.messages.returnToTitle))
       await this.returnToTitle();
   }
 
@@ -1208,10 +1245,10 @@ export class RScriptGame {
   /** sub_41EA70 (save) / sub_41EB60 (load) and the standalone load (sub_420200). */
   private async chooseSlot(slot: number, save: boolean): Promise<void> {
     const exists = !!(await this.readSlot(slot));
-    const {confirm} = this.host;
     if (save) {
       this.playSystemSound(1);
-      if (exists && !(await confirm(RScriptMessages.confirm, RScriptMessages.overwrite))) return;
+      if (exists && !(await this.confirm(this.host.messages.confirm, this.host.messages.overwrite)))
+        return;
       const previous = this.memory.configWord(0x3a) & 0xffff;
       this.memory.setConfigWord(0x3a, slot);
       await this.saveSlot(slot);
@@ -1221,7 +1258,10 @@ export class RScriptGame {
       return;
     }
     if (!exists) return;
-    if (!this.screens.standalone && !(await confirm(RScriptMessages.confirm, RScriptMessages.load)))
+    if (
+      !this.screens.standalone &&
+      !(await this.confirm(this.host.messages.confirm, this.host.messages.load))
+    )
       return;
     this.playSystemSound(1);
     await this.loadSlot(slot);
@@ -1246,7 +1286,7 @@ export class RScriptGame {
 
   /** WM_CLOSE of the game window: quits after the native confirmation. */
   async quit(): Promise<void> {
-    if (!(await this.host.confirm(RScriptMessages.quitCaption, RScriptMessages.quit))) return;
+    if (!(await this.confirm(this.host.messages.quitCaption, this.host.messages.quit))) return;
     await this.saveSystem();
     this.dispose();
     this.host.exit();

@@ -154,7 +154,11 @@ export class RScriptMessageWindow extends RScriptContainer implements RScriptMes
   }
 
   loadPanel(): Promise<void> {
-    return this.panel.load(this.env.images, this.env.systemDirectory);
+    return this.panel.load(
+      this.env.images,
+      this.env.systemDirectory,
+      this.env.memory.revision.panelCommands,
+    );
   }
 
   /**
@@ -243,9 +247,19 @@ export class RScriptMessageWindow extends RScriptContainer implements RScriptMes
     );
   }
 
+  /**
+   * The box a script selects. Natively a selector past box 3 addresses the records and
+   * objects that follow the boxes; here it stops the script with an error.
+   */
+  private box(index: number): RScriptTextBox {
+    const box = this.boxes[index];
+    if (!box) throw new Error(`Message box ${index} is out of range`);
+    return box;
+  }
+
   /** sub_418010: shows or hides a box; hiding also clears it. */
   async showBox(box: number, visible: boolean, skipping: boolean): Promise<void> {
-    const target = this.boxes[box]!;
+    const target = this.box(box);
     target.setVisible(visible, skipping);
     if (!visible) this.clear(box, skipping);
     if (!skipping && visible) await target.apply();
@@ -264,7 +278,7 @@ export class RScriptMessageWindow extends RScriptContainer implements RScriptMes
     await this.showBox(box, true, skipping);
     if (box === 0) this.pushBacklog(newPage);
     if (skipping) return;
-    const target = this.boxes[box]!;
+    const target = this.box(box);
     const text = await this.env.scriptString(source.script, source.text);
     if (newPage) {
       this.pageText = text;
@@ -284,8 +298,8 @@ export class RScriptMessageWindow extends RScriptContainer implements RScriptMes
     if (box === 0) this.pushBacklog(true);
     if (skipping) return;
     this.pageText = new Uint8Array();
-    this.boxes[box]!.clearText();
-    this.boxes[box]!.setName(null);
+    this.box(box).clearText();
+    this.box(box).setName(null);
   }
 
   /** sub_4182E0: reveals every visible box. */
@@ -340,14 +354,14 @@ export class RScriptMessageWindow extends RScriptContainer implements RScriptMes
   }
 
   setBoxWord(box: number, field: number, value: number): void {
-    this.boxes[box]!.setWord(field, value);
+    this.box(box).setWord(field, value);
   }
   setBoxDword(box: number, field: number, value: number): void {
-    this.boxes[box]!.setDword(field, value);
+    this.box(box).setDword(field, value);
   }
   /** Applies record changes to one box, or to boxes 1..3 like the native "all" setters. */
   async applyBoxes(box: number, all: boolean): Promise<void> {
-    for (const index of all && box !== 0 ? [1, 2, 3] : [box]) await this.boxes[index]!.apply();
+    for (const index of all && box !== 0 ? [1, 2, 3] : [box]) await this.box(index).apply();
   }
 
   // Backlog browsing inside box 0 (0x4175A0, 0x417550, 0x4172F0, 0x416FE0).

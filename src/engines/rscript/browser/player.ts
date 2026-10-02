@@ -13,15 +13,17 @@ import type {YuvFrame} from '../../../video/frame.js';
 import {StreamMovieVoice} from '../../../video/stream-voice.js';
 import {YuvRenderer} from '../../../video/renderer.js';
 import type {RScriptApini} from '../apini.js';
+import type {RScriptMessages} from '../messages.js';
 import type {RScriptFiles} from '../files.js';
 import {RScriptGame, type RScriptSaveStorage} from '../runtime/game.js';
 import {CanvasGlyphRasterizer, CanvasPresenter} from './canvas.js';
 import {RScriptDomText} from './dom-text.js';
-import {listRScriptFonts} from './fonts.js';
+import {listRScriptFonts} from './font-catalog.js';
 
 export interface RScriptBrowserPlayerOptions {
   readonly files: RScriptFiles;
   readonly apini: RScriptApini;
+  readonly messages: RScriptMessages;
   readonly saves: RScriptSaveStorage;
   readonly document: Document;
   /**
@@ -128,6 +130,7 @@ export class RScriptBrowserPlayer {
     this.game = new RScriptGame({
       files: options.files,
       apini,
+      messages: options.messages,
       presenter: {
         present: (frame, rect, offsetX, offsetY) => {
           canvasPresenter.present(frame, rect, offsetX, offsetY);
@@ -144,7 +147,7 @@ export class RScriptBrowserPlayer {
       saves: options.saves,
       playMovie: (path) => this.playMovie(path),
       stopMovie: () => this.skipMovie?.(),
-      confirm: (caption, text) => messageBox.confirm(caption, text),
+      messageBox,
       listFonts: () => listRScriptFonts(document),
       setFullscreen: (fullscreen) => options.setFullscreen?.(fullscreen),
       // The shared audio host resumes the context again on activation.

@@ -1,4 +1,4 @@
-import {decodeCp932, isCp932LeadByte} from '../text.js';
+import {decodeCp932, isCp932LeadByte} from '../../../text/cp932.js';
 import {compositeOver} from '../graphics/blend.js';
 import {createSurface, type RScriptRect, type RScriptSurface} from '../graphics/pixels.js';
 import {RScriptContainer, RScriptSprite, type BakedGlyph} from '../graphics/sprite.js';
@@ -581,7 +581,19 @@ export class RScriptTextBlock extends RScriptContainer {
         // Blend mode 2 hides the glyph as its level rises: reveal fades run from 255 to 0
         // (0x45BC80) and 1.9 dims earlier messages at 128 (0x430F40).
         opacity: sprite.blend.mode === 2 ? 1 - sprite.blend.alpha / 255 : 1,
-        ruby: glyph.ruby?.length ? {text: glyph.rubyText, span: glyph.rubyEnd - index + 1} : null,
+        ruby: glyph.ruby?.length
+          ? {
+              text: glyph.rubyText,
+              span: glyph.rubyEnd - index + 1,
+              glyphs: glyph.ruby.map((ruby, i) => ({
+                text: Array.from(glyph.rubyText)[i] ?? '',
+                x: ruby.x,
+                y: ruby.y,
+                width: ruby.width,
+                height: ruby.height,
+              })),
+            }
+          : null,
         vertical: !!this.style.vertical,
       });
     });

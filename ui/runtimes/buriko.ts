@@ -498,7 +498,7 @@ function installationSnapshot(installation: Installation): CachedInstallation {
 }
 
 const installationControls = mountInstallationControls({
-  key: 'buriko',
+  player: 'buriko',
   choose: chooseButton,
   input: choose,
   current: () => selectedSnapshot,

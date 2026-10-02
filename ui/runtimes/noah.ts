@@ -29,7 +29,7 @@ textMode.onchange = () => {
 };
 const status = element('status'),
   sidebar = element('sidebar');
-const {collapseOptions: collapse} = mountGameViewer('noah');
+const {collapseOptions: collapse} = mountGameViewer('chaos-head-noah');
 let fullscreenControls: ReturnType<typeof mountFullscreenControls> | undefined;
 const displayHost = new BrowserPageFullscreenHost(
   element('display'),
@@ -155,7 +155,7 @@ async function selectInstallation(selection: InstallationSelection): Promise<voi
   });
 }
 const installationControls = mountInstallationControls({
-  key: 'chaos-head-noah-gog',
+  player: 'chaos-head-noah',
   choose: element<HTMLButtonElement>('choose'),
   input: files,
   current: () => selectedInstallation,
