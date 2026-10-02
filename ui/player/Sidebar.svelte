@@ -30,7 +30,8 @@
       <a class="sidebar-library-link" href="./">← Library</a>
       <label for="viewer-game">Select player</label>
       <select id="viewer-game" value={game}>
-        <option value="noah">CHAOS;HEAD NOAH</option><option value="buriko">BGI / Ethornell</option>
+        <option value="noah">CHAOS;HEAD NOAH</option><option value="buriko">BGI / Ethornell</option
+        ><option value="rscript">codeX RScript</option>
       </select>
     </section>
     <section>
@@ -58,8 +59,14 @@
         <option value="native">Native</option><option value="dom">DOM text</option>
       </select>
       <p id="text-help">
-        DOM text uses selectable browser fonts with the game’s line breaks. Glyph placement and
-        visual effects are approximate.
+        {#if game === 'rscript'}
+          DOM text places selectable text over the game’s own text for copying and dictionary
+          extensions; a custom style shows it in your font instead. Click outside the text to
+          continue; Shift is left to the extension.
+        {:else}
+          DOM text uses selectable browser fonts with the game’s line breaks. Glyph placement and
+          visual effects are approximate.
+        {/if}
       </p>
       <DomTextStyle />
     </section>
