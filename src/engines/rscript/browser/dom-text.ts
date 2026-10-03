@@ -1,5 +1,5 @@
 import {DomGlyphSlots} from '../../../text/dom-glyph-slots.js';
-import type {GlyphSlot, TextGlyph} from '../../../text/glyph-slots.js';
+import {slotText, type GlyphSlot, type TextGlyph} from '../../../text/glyph-slots.js';
 import {getDomTextStyle, subscribeDomTextStyle} from '../../../text/dom-text-style.js';
 import {objectFitPlacement} from '../../../graphics/object-fit.js';
 import {RScriptContainer, type BakedGlyph, type RScriptNode} from '../graphics/sprite.js';
@@ -146,12 +146,49 @@ export class RScriptDomText {
         if (this.shown.get(slot.id) !== key) {
           this.shown.set(slot.id, key);
           this.slots.show(slot, z, family, false);
+          if (slot.vertical) this.placeColumns(slot);
         }
         z++;
       }
     }
     for (const id of this.shown.keys()) if (!visible.has(id)) this.shown.delete(id);
     this.slots.retain(visible);
+  }
+
+  /** Keep RScript's right-to-left columns anchored as more glyphs are revealed. */
+  private placeColumns(slot: GlyphSlot): void {
+    const content = slotText(slot);
+    if (!content) return;
+    const text = this.element.querySelector<HTMLElement>(
+      `[data-text-id="${slot.id}"] [data-game-text]`,
+    );
+    if (!text) return;
+    const columns = new Map<number, {right: number; width: number}>();
+    for (const glyph of slot.glyphs) {
+      const column = columns.get(glyph.line);
+      columns.set(glyph.line, {
+        right: Math.max(column?.right ?? -Infinity, glyph.x + glyph.width),
+        width: Math.max(column?.width ?? 0, glyph.width),
+      });
+    }
+    const first = Math.min(...columns.keys()),
+      last = Math.max(...columns.keys()),
+      anchor = columns.get(first)!,
+      nativePitch =
+        last > first ? (anchor.right - columns.get(last)!.right) / (last - first) : anchor.width,
+      custom = getDomTextStyle(),
+      pitch =
+        custom.enabled && custom.layout === 'natural'
+          ? Math.max(nativePitch, content.size * custom.scale * 1.25)
+          : nativePitch,
+      width = (last - first + 1) * pitch;
+    // The shared renderer's horizontal origin and whole-block vertical line-height
+    // cannot position a multi-column RScript page. Each CSS line box is one column;
+    // centre the first box on its native cell and let subsequent boxes grow leftward.
+    text.style.left = `${anchor.right + (pitch - anchor.width) / 2 - width - content.clip.x}px`;
+    text.style.width = `${width}px`;
+    text.style.lineHeight = `${pitch}px`;
+    text.style.textIndent = '0px';
   }
 
   private clear(): void {
