@@ -30,6 +30,12 @@ vertical text, clearing and teardown against generated text and pixels only. It
 also checks canvas/DOM alignment through the shared window host's scaling and
 page expansion. It does not open a game installation or display game assets.
 
+`rscript-dom-text.html` checks RScript vertical DOM text using synthetic glyphs:
+column placement during reveal, clipping, blank columns, selection and copying,
+transparent overlays, larger natural text and horizontal text. After building,
+open `/tests/browser/rscript-dom-text.html` on the development server above and
+expect PASS. No game installation is needed.
+
 `draw-list.html` exercises the reusable Canvas sprite backend: seven pixel checks for RGB modulation, opacity, source cropping, invalidation and clearing. Copy it to `dist/draw-list-test.html` and open that page through the existing development server.
 
 `dom-text-style.html` checks reader DOM text styles: custom families with the game
