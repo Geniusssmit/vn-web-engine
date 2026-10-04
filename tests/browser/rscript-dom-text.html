@@ -1,0 +1,150 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>RScript vertical DOM text regression</title>
+<style>
+  #stage {
+    position: relative;
+    width: 800px;
+    height: 600px;
+    background: #123;
+  }
+  canvas {
+    display: block;
+    width: 800px;
+    height: 600px;
+  }
+</style>
+<p id="status">Running synthetic RScript text checks…</p>
+<div id="stage"><canvas width="800" height="600"></canvas></div>
+<script type="module">
+  import {RScriptDomText} from '../../dist/engines/rscript/browser/dom-text.js';
+  import {RScriptContainer} from '../../dist/engines/rscript/graphics/sprite.js';
+  import {setDomTextStyle} from '../../dist/text/dom-text-style.js';
+
+  const status = document.querySelector('#status');
+  try {
+    const assert = (ok, message) => {
+      if (!ok) throw Error(message);
+    };
+    const root = new RScriptContainer(800, 600);
+    const page = new RScriptContainer(646, 480);
+    root.visible = page.visible = true;
+    page.setPosition(114, 30);
+    root.add(page, 0);
+    const layer = new RScriptDomText({
+      document,
+      parent: document.querySelector('#stage'),
+      canvas: document.querySelector('canvas'),
+      width: 800,
+      height: 600,
+      families: () => 'serif',
+      hideText() {},
+      wheel() {},
+      cancel() {},
+    });
+    const glyph = (text, column, row) => ({
+      text,
+      x: 612 - column * 34,
+      y: row * 24,
+      width: 24,
+      height: 24,
+      newline: row === 0 && column > 0,
+      color: 0xffffff,
+      face: 0,
+      bold: false,
+      italic: false,
+      shadow: false,
+      opacity: 1,
+      ruby: null,
+      vertical: true,
+    });
+    const columns = (count, blanks = false) =>
+      Array.from({length: count}, (_, column) =>
+        [...(blanks && column < 3 ? '　' : '日本語')].map((text, row) => glyph(text, column, row)),
+      ).flat();
+    const span = () => layer.element.querySelector('[data-game-text]');
+    const rect = (offset) => {
+      const range = document.createRange();
+      range.setStart(span().firstChild, offset);
+      range.setEnd(span().firstChild, offset + 1);
+      return range.getBoundingClientRect();
+    };
+    const inside = () => {
+      const box = span().parentElement.getBoundingClientRect(),
+        text = span().textContent;
+      for (let i = 0; i < text.length; i++) {
+        if (/\s/.test(text[i])) continue;
+        const r = rect(i);
+        assert(
+          r.left >= box.left - 1 &&
+            r.right <= box.right + 1 &&
+            r.top >= box.top - 1 &&
+            r.bottom <= box.bottom + 1,
+          `Character ${i} is clipped`,
+        );
+      }
+    };
+    setDomTextStyle({enabled: true, effects: false, layout: 'fit'});
+    page.bakedText = columns(1);
+    layer.setEnabled(true, root);
+    const node = span().firstChild,
+      first = rect(0);
+    for (const count of [2, 5, 17]) {
+      page.bakedText = columns(count);
+      layer.update();
+      assert(span().firstChild === node, 'Reveal replaced the text node');
+      assert(Math.abs(rect(0).left - first.left) < 1, `First column moved with ${count} columns`);
+      assert(Math.abs(rect(0).left - rect(4).left - 34) < 1, 'Native column pitch lost');
+      inside();
+    }
+    page.bakedText = columns(17, true);
+    layer.update();
+    inside();
+    assert(span().textContent.split('\n').length === 17, 'Blank columns lost');
+    const selection = document.getSelection(),
+      range = document.createRange();
+    range.selectNodeContents(span().firstChild);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const event = new Event('copy', {bubbles: true, cancelable: true});
+    const clipboard = new Map();
+    Object.defineProperty(event, 'clipboardData', {
+      value: {setData: (type, value) => clipboard.set(type, value)},
+    });
+    document.dispatchEvent(event);
+    assert(
+      clipboard.get('text/plain') === page.bakedText.map((g) => g.text).join(''),
+      'Copy lost text across columns',
+    );
+    selection.removeAllRanges();
+    setDomTextStyle({enabled: false});
+    assert(
+      getComputedStyle(span()).color === 'rgba(0, 0, 0, 0)',
+      'Native overlay is no longer transparent',
+    );
+    inside();
+    page.bakedText = columns(2);
+    layer.update();
+    setDomTextStyle({enabled: true, layout: 'natural', scale: 2});
+    assert(
+      Math.abs(rect(0).left - rect(4).left - 60) < 1,
+      'Natural columns overlap at larger size',
+    );
+    // Horizontal RScript text continues through the unmodified shared layout.
+    page.bakedText = columns(1).map((g, i) => ({...g, vertical: false, x: i * 24, y: 0}));
+    setDomTextStyle({layout: 'fit', scale: 1});
+    assert(span().classList.contains('game-text-horizontal'), 'Horizontal text changed direction');
+    assert(
+      rect(1).left > rect(0).left && Math.abs(rect(1).top - rect(0).top) < 1,
+      'Horizontal row misplaced',
+    );
+    layer.setEnabled(false, root);
+    assert(!layer.element.querySelector('[data-game-text]'), 'Disabled layer retained text');
+    layer.dispose();
+    status.textContent =
+      'PASS: reveal anchor, 17 columns, clipping, blank columns, stable text node, copy, transparent overlay, larger natural text, horizontal text, cleanup.';
+  } catch (error) {
+    status.textContent = `FAIL: ${error.message}`;
+    console.error(error);
+  }
+</script>
