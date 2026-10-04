@@ -2,6 +2,8 @@ import type {BurikoD3dxEffectLibrary} from './d3dx-effect-library.js';
 import type {BurikoBitmapRectangle} from './bitmap.js';
 import {
   rasterTextBitmap,
+  rasterTextGlyphKey,
+  readRasterText,
   visibleRasterText,
   type RasterTextGlyph,
 } from '../../../text/raster-text.js';
@@ -9,7 +11,6 @@ import {
   BrowserRasterTextPresentation,
   mapRasterTextGlyphs,
   rasterTextOutsideRegion,
-  type BrowserRasterTextFrame,
 } from '../../../text/browser-raster-text-presentation.js';
 import {LinearRgbWasm} from '../../../graphics/linear-rgb-wasm.js';
 import {getRuntimeProfile} from '../../../platform/runtime-profile.js';
@@ -24,7 +25,11 @@ import type {BurikoDisplayCapabilities} from './display-capabilities.js';
 import {burikoDisplayViewport} from './display-geometry.js';
 import {BurikoDisplayManager} from './display-manager.js';
 import type {BurikoNativeDisplayState} from './display-state.js';
-import {BurikoDisplayTexture, burikoDisplayTextureSize} from './display-texture.js';
+import {
+  BurikoDisplayTexture,
+  burikoDisplayTextureSize,
+  burikoRectangleUnion,
+} from './display-texture.js';
 import {BurikoGpuCompositor, burikoGpuCompositingMode} from './display-gpu-compositor.js';
 import type {BurikoGpuFrames} from './object-manager.js';
 import {burikoGpuDeferrer, setBurikoGpuDeferrer} from './bitmap-gpu-target.js';
@@ -168,6 +173,8 @@ export class BurikoDisplayDevice {
   private frameDamage: Rect | null | undefined; // Undefined: full upload; null: no pending writes.
   private ordinaryTextDraw: TextDraw | null = null;
   private movieTextDraw: TextDraw | null = null;
+  /** Presents the latest frame's text again, after its GPU ink results change. */
+  private presentText: (() => void) | null = null;
   dialogBoxMode = false;
   textureAlpha = 0; // 1e6a5c.
   filterMode = 0; // 1e6a58.
@@ -186,7 +193,35 @@ export class BurikoDisplayDevice {
     if (presentationMode === 'canvas') {
       canvas.addEventListener('contextlost', this.onContextLost);
       canvas.addEventListener('contextrestored', this.onContextRestored);
+      this.unsubscribeTextMode =
+        textPresentation?.onTextModeChange(canvas, () => this.presentTextMode()) ?? null;
     }
+  }
+  private readonly unsubscribeTextMode: (() => void) | null = null;
+  /** DOM text replaces native glyphs, so its canvas presents the textless plane. */
+  private get textless(): boolean {
+    return (this.textPresentation?.textMode ?? 'native') === 'dom';
+  }
+  /** The plane presented from `texture`: a view of its textless plane in DOM text mode. */
+  private presented(texture: BurikoDisplayTexture): BurikoDisplayTexture {
+    if (!this.textless) return texture;
+    const storage = rasterTextBitmap(texture.textBitmap).storage;
+    if (storage === texture.storage) return texture;
+    const view = Object.create(texture) as BurikoDisplayTexture;
+    Object.defineProperty(view, 'storage', {value: storage});
+    return view;
+  }
+  /** A text mode change redraws every display object and presents the other plane. */
+  private presentTextMode(): void {
+    if (!this.isPresent()) return;
+    // GPU frames draw native pixels only: hand the display back to software first.
+    if (this.textless) this.leaveGpuCompositing();
+    this.rasterValid = false;
+    this.gpu?.invalidate();
+    this.gpuDrawn = null;
+    this.markFrameChanged();
+    this.manager.damage.force();
+    this.manager.redraw.request(0);
   }
   private readonly onContextLost = (event: Event): void => {
     event.preventDefault();
@@ -476,7 +511,7 @@ export class BurikoDisplayDevice {
     // GPU presentation reads the source's dirty texels directly and defers the sampled copy.
     const gpu = this.frame !== null && mode !== 1 ? this.gpuPresenter() : null;
     if (gpu === null) this.leaveGpuCompositing();
-    const changed = gpu === null ? sampled.updateFrom(source) : false;
+    const changed = gpu === null ? this.updateSampled(sampled, source) : false;
     if (mode === 0 || mode === 2) this.sampler = mode === 0 ? 'linear' : 'point';
     if (mode === 1 && this.shader === null)
       throw new Error('Buriko presentation shader has not been created');
@@ -498,7 +533,7 @@ export class BurikoDisplayDevice {
       }
       if (gpu !== null) {
         this.leaveGpuCompositing();
-        sampled.updateFrom(source);
+        this.updateSampled(sampled, source);
         this.rasterValid = false;
       }
       this.leaveGpu();
@@ -517,8 +552,8 @@ export class BurikoDisplayDevice {
         !cubic &&
         this.rasterCubic === cubic &&
         this.rasterSampler === this.sampler &&
-        sampled.updateBounds !== null
-          ? this.changedOutputRectangle(sampled, sampled.updateBounds)
+        this.sampledBounds !== null
+          ? this.changedOutputRectangle(sampled, this.sampledBounds)
           : undefined;
       // A changed texel outside this quad's sample footprint leaves the frame intact.
       if (incremental === null) return;
@@ -529,12 +564,22 @@ export class BurikoDisplayDevice {
         pixels.fill(0);
         for (let offset = 3; offset < pixels.length; offset += 4) pixels[offset] = 255;
       }
-      this.rasterizeQuad(sampled, cubic, incremental);
+      this.rasterizeQuad(this.presented(sampled), cubic, incremental);
       this.rasterVertices.set(vertices);
       this.rasterCubic = cubic;
       this.rasterSampler = this.sampler;
       this.rasterValid = true;
     }
+  }
+  /** Texels of the presented plane changed by the last `updateSampled`. */
+  private sampledBounds: BurikoBitmapRectangle | null = null;
+  private updateSampled(sampled: BurikoDisplayTexture, source: BurikoDisplayTexture): boolean {
+    sampled.updateFrom(source);
+    // Equal native pixels can still carry different textless pixels.
+    this.sampledBounds = this.textless
+      ? burikoRectangleUnion(sampled.updateBounds, sampled.textUpdateBounds)
+      : sampled.updateBounds;
+    return this.sampledBounds !== null;
   }
   /** B31A0 draws the real movie texture without clearing or uploading ordinary display pixels. */
   drawMovieTexture(
@@ -582,15 +627,14 @@ export class BurikoDisplayDevice {
       if (this.drawMovieGpu(texture)) return;
       this.leaveGpu();
       this.markFrameChanged();
-      this.rasterizeQuad(texture, false);
+      this.rasterizeQuad(this.presented(texture), false);
     }
   }
   private gpuEligible(): boolean {
     return (
       this.presentationMode === 'canvas' &&
       getRuntimeProfile() === 'browser-optimized' &&
-      burikoGpuPresentationEnabled() &&
-      (this.textPresentation?.textMode ?? 'native') === 'native'
+      burikoGpuPresentationEnabled()
     );
   }
   private gpuPresenter(): BurikoGpuPresenter | null {
@@ -637,10 +681,6 @@ export class BurikoDisplayDevice {
     if (this.gpuFrame) return;
     gpu.invalidate();
     this.gpuDrawn = null;
-    // DOM text reuses `frame` outside the quad; keep it the opaque black of a full raster.
-    const pixels = this.frame!.data;
-    pixels.fill(0);
-    for (let offset = 3; offset < pixels.length; offset += 4) pixels[offset] = 255;
   }
   private leaveGpu(): void {
     if (!this.gpuFrame) return;
@@ -657,10 +697,21 @@ export class BurikoDisplayDevice {
     this.enterGpu(gpu);
     if (resumed && changed === null && this.gpuDrawn === coordinates) return true;
     const {logicalWidth, logicalHeight} = this.display;
+    // DOM text draws the textless image; GPU compositing still reads and writes the native one.
+    const slot = this.textless ? 'textless' : 'display';
     if (
       !gpu.upload('display', source, logicalWidth, logicalHeight, changed) ||
+      (slot === 'textless' &&
+        !gpu.upload(
+          'textless',
+          source,
+          logicalWidth,
+          logicalHeight,
+          changed,
+          this.presented(source).storage,
+        )) ||
       !gpu.draw(
-        'display',
+        slot,
         source,
         coordinates,
         this.sampler,
@@ -689,6 +740,7 @@ export class BurikoDisplayDevice {
       this.gpuCompositor?.dispose();
       this.gpuCompositor = new BurikoGpuCompositor(gpu);
     }
+    this.gpuCompositor.maintainTextless = this.textless;
     this.manager.gpuFrames = mode === 'verify' ? this.verifiedGpuFrames : this.gpuFrames;
     setBurikoGpuDeferrer(this.gpuCompositor);
   }
@@ -708,9 +760,8 @@ export class BurikoDisplayDevice {
     const source = this.source,
       compositor = this.gpuCompositor;
     if (source === null || compositor === null || !compositor.presenter.owns(source)) return;
-    compositor.syncSoftware(source);
-    // GPU frames skip the display's raster-text plane, which DOM text reads.
-    if ((this.textPresentation?.textMode ?? 'native') !== 'native') {
+    // Native-only GPU frames skip the textless plane, which DOM text presents.
+    if (!compositor.syncSoftware(source) && this.textless) {
       this.manager.damage.force();
       this.manager.redraw.request(0);
     }
@@ -724,7 +775,14 @@ export class BurikoDisplayDevice {
     if (coordinates === null) return false;
     const {logicalWidth, logicalHeight} = this.display;
     if (
-      !gpu.upload('movie', texture, logicalWidth, logicalHeight, undefined) ||
+      !gpu.upload(
+        'movie',
+        texture,
+        logicalWidth,
+        logicalHeight,
+        undefined,
+        this.presented(texture).storage,
+      ) ||
       !gpu.draw(
         'movie',
         texture,
@@ -1026,22 +1084,79 @@ export class BurikoDisplayDevice {
       }
     }
   }
-  private domFrame(
-    native: ImageData,
+  /** Latest GPU ink results by glyph identity, and the pending poll for the next one. */
+  private gpuInk = new Map<string, boolean>();
+  private gpuInkPoll = 0;
+  /**
+   * visibleRasterText for a display the GPU owns. Its ink test runs on the GPU and arrives a
+   * frame or more later, so a glyph without a result counts as visible; a covered one leaves
+   * when its result arrives. Each call starts the next query when none is in flight.
+   */
+  private gpuVisibleText(
+    compositor: BurikoGpuCompositor,
+    source: BurikoDisplayTexture,
+  ): RasterTextGlyph[] {
+    const glyphs = readRasterText(source.textBitmap),
+      keys: string[] = [],
+      clips: BurikoBitmapRectangle[] = [];
+    for (const glyph of glyphs) {
+      if (!glyph.text.trim()) continue;
+      const {clip} = glyph;
+      keys.push(rasterTextGlyphKey(glyph));
+      clips.push({
+        left: Math.max(0, Math.floor(clip.x)),
+        top: Math.max(0, Math.floor(clip.y)),
+        right: Math.ceil(clip.x + clip.width) - 1,
+        bottom: Math.ceil(clip.y + clip.height) - 1,
+      });
+    }
+    if (compositor.queryInk(source, keys, clips)) this.pollGpuInk(compositor, source);
+    return glyphs.filter(
+      (glyph) => !glyph.text.trim() || (this.gpuInk.get(rasterTextGlyphKey(glyph)) ?? true),
+    );
+  }
+  /** Take the query result once the GPU finishes it, and present text whose visibility changed. */
+  private pollGpuInk(compositor: BurikoGpuCompositor, source: BurikoDisplayTexture): void {
+    const view = this.canvas.ownerDocument.defaultView;
+    if (view === null || this.gpuInkPoll !== 0) return;
+    const poll = () => {
+      this.gpuInkPoll = 0;
+      if (this.gpuCompositor !== compositor || this.source !== source) return;
+      const result = compositor.takeInk();
+      if (result === null) {
+        this.gpuInkPoll = view.requestAnimationFrame(poll);
+        return;
+      }
+      const changed = [...result].some(([key, ink]) => (this.gpuInk.get(key) ?? true) !== ink);
+      this.gpuInk = result;
+      // Unchanged visibility needs no new presentation, which would also query again.
+      if (changed) this.presentText?.();
+    };
+    this.gpuInkPoll = view.requestAnimationFrame(poll);
+  }
+  /** Text of the presented frame, in output coordinates. */
+  private domGlyphs(
+    frame: ImageData,
     ordinary: TextDraw | null,
     movie: TextDraw | null,
-  ): BrowserRasterTextFrame {
-    const frame = new ImageData(native.data.slice(), native.width, native.height);
+  ): RasterTextGlyph[] {
     let glyphs: RasterTextGlyph[] = [];
+    const source = this.source,
+      compositor = this.gpuCompositor;
+    // GPU compositing keeps current pixels on the GPU; it reports glyph ink asynchronously.
+    const owned =
+      ordinary !== null && source !== null && compositor !== null
+        ? compositor.ownsText(source)
+        : 'none';
+    // Native-only GPU frames left no textless plane to compare; a forced redraw follows.
+    if (owned === 'native') return [];
     // GPU presentation defers the sampled copy; DOM text reads the sampled text plane.
-    if (ordinary !== null && this.source !== null && this.sampled !== null)
-      this.sampled.updateFrom(this.source, true);
+    if (owned === 'none' && ordinary !== null && source !== null && this.sampled !== null)
+      this.sampled.updateFrom(source, true);
     for (const draw of [ordinary, movie]) {
       if (draw === null) continue;
+      const gpuText = owned === 'text' && draw === ordinary;
       const bitmap = draw.texture.textBitmap;
-      const alternate = Object.create(draw.texture) as BurikoDisplayTexture;
-      Object.defineProperty(alternate, 'storage', {value: rasterTextBitmap(bitmap).storage});
-      this.rasterizeQuad(alternate, draw.cubic, undefined, frame, draw.vertices, draw.sampler);
       const quad = new DataView(
         draw.vertices.buffer,
         draw.vertices.byteOffset,
@@ -1067,7 +1182,7 @@ export class BurikoDisplayDevice {
       if (draw === movie) glyphs = rasterTextOutsideRegion(glyphs, clip);
       glyphs.push(
         ...mapRasterTextGlyphs(
-          visibleRasterText(bitmap),
+          gpuText ? this.gpuVisibleText(compositor!, source!) : visibleRasterText(bitmap),
           left + 0.5,
           top + 0.5,
           width / u,
@@ -1076,7 +1191,7 @@ export class BurikoDisplayDevice {
         ),
       );
     }
-    return {frame, glyphs};
+    return glyphs;
   }
   /** b30c0: absent scanline timing leaves the wait count zero; successful commit records native time. */
   async present(output: {waitCount: number}): Promise<number> {
@@ -1107,7 +1222,9 @@ export class BurikoDisplayDevice {
       const frame = this.frame,
         ordinary = this.ordinaryTextDraw,
         movie = this.movieTextDraw;
-      this.textPresentation.replace(this.canvas, () => this.domFrame(frame, ordinary, movie));
+      const glyphs = () => this.domGlyphs(frame, ordinary, movie);
+      this.textPresentation.replace(this.canvas, glyphs);
+      this.presentText = () => this.textPresentation?.refreshGlyphs(this.canvas, glyphs);
     }
     this.frameDamage = null;
     this.display.lastPresentMilliseconds = Number(BigInt.asUintN(32, this.clock.read()));
@@ -1155,6 +1272,7 @@ export class BurikoDisplayDevice {
       this.canvas.removeEventListener('contextlost', this.onContextLost);
       this.canvas.removeEventListener('contextrestored', this.onContextRestored);
     }
+    this.unsubscribeTextMode?.();
     this.disposed = true;
   }
 }
